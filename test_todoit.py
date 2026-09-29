@@ -171,6 +171,15 @@ class Display(unittest.TestCase):
         self.assertEqual(todoit.momentum(s, at(28, 16, 0)), (2, 7, 2, 2))
         self.assertEqual(todoit.momentum(state(), at(28, 16, 0)), (0, 0, 0, 0))
 
+    def test_shimmer_stays_on_the_filled_part_of_the_bar(self):
+        scr = mock.Mock(**{"getmaxyx.return_value": (20, 90)})  # bar 30 wide
+        s = state(daily=[task("a", "09:00", done=True), task("b", "18:00")])  # 1/2 done -> 15 filled
+        with mock.patch.object(todoit, "put") as put, mock.patch.object(todoit, "now", return_value=at(28, 16, 0)):
+            for f in range(40):
+                todoit.shimmer(scr, s, f)
+            drawn = {c.args[2] for c in put.call_args_list}
+        self.assertEqual(drawn, set(range(todoit.BAR_X, todoit.BAR_X + 15)))  # sweeps every filled cell, never the dim rest
+
     def test_fit_counts_wide_chars_as_two_columns(self):
         self.assertEqual(todoit.fit("日本語abc", 5), "日本")  # 語 needs 2 more cols: stop, never skip ahead
         self.assertEqual(todoit.fit("review a PR", 6), "review")

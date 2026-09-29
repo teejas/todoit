@@ -31,6 +31,7 @@ HELP = "space done  a add todo  r add daily  e edit  d delete  o open link  j/k 
 CHEERS = ("nice.", "crushed it.", "one down.", "boom.", "look at you go.", "chef's kiss.", "shipped.", "unstoppable.")
 G, DRAG = 0.05, 0.92  # particle gravity (rows/frame^2) and air drag; tune to taste
 RED, YELLOW, GREEN, CYAN, MAGENTA, BLUE = range(1, 7)
+BAR_X = 10  # momentum bar's first column
 log = logging.getLogger("todoit")
 
 
@@ -210,6 +211,22 @@ def momentum(s, t):
             sum(t < d and d.date() == t.date() for d in dues), sum(t >= d for d in dues))
 
 
+def bar_size(w, done, total):
+    """(bar width, filled cells) for the momentum bar, which starts at column BAR_X."""
+    bar = max(10, min(30, w - 55))
+    return bar, round(bar * done / total) if total else 0
+
+
+def shimmer(scr, s, f):
+    """A glint sweeping along the filled part of the momentum bar, then a short pause off the end."""
+    done, total, _, _ = momentum(s, now())
+    _, fill = bar_size(scr.getmaxyx()[1], done, total)
+    head = 2 * f % (fill + 8)
+    for x in range(head - 3, head + 1):
+        if 0 <= x < fill:
+            put(scr, 1, BAR_X + x, "━", curses.A_BOLD if x == head else C(YELLOW) | curses.A_BOLD)
+
+
 def draw(scr, s, cur, t):
     """Render the list; returns the screen row of each task, in cursor order."""
     scr.erase()
@@ -218,12 +235,11 @@ def draw(scr, s, cur, t):
     stamp = f"{t:%a %b %-d  %H:%M}"
     put(scr, 0, w - len(stamp) - 1, stamp, curses.A_DIM)
     done, total, today, overdue = momentum(s, t)
-    bar = max(10, min(30, w - 55))
-    fill = round(bar * done / total) if total else 0
+    bar, fill = bar_size(w, done, total)
     put(scr, 1, 1, "MOMENTUM", C(MAGENTA) | curses.A_BOLD)
-    put(scr, 1, 10, "━" * fill, C(GREEN) | curses.A_BOLD)
-    put(scr, 1, 10 + fill, "━" * (bar - fill), curses.A_DIM)
-    put(scr, 1, 11 + bar, f"{done}/{total} done", curses.A_BOLD)
+    put(scr, 1, BAR_X, "━" * fill, C(GREEN) | curses.A_BOLD)
+    put(scr, 1, BAR_X + fill, "━" * (bar - fill), curses.A_DIM)
+    put(scr, 1, BAR_X + bar + 1, f"{done}/{total} done", curses.A_BOLD)
     stats = f"{today} due today · {overdue} overdue"
     put(scr, 1, w - len(stats) - 1, stats, C(RED) | curses.A_BOLD if overdue else curses.A_DIM)
     y, ys = 3, []
@@ -362,6 +378,7 @@ def play(scr, s, cur, frames, fx):
         for f in range(frames):
             draw(scr, s, cur, now())
             step(scr, ps)
+            shimmer(scr, s, f)
             fx(f, ps)
             if scr.getch() != -1:
                 break
