@@ -15,8 +15,11 @@ def at(day, hh, mm):
     return datetime(2026, 9, day, hh, mm)
 
 
-def task(title, due, done=False, sent=None):
-    return {"title": title, "due": due, "done": done, "sent": sent or []}
+def task(title, due, done=False, sent=None, done_on=None):
+    t = {"title": title, "due": due, "done": done, "sent": sent or []}
+    if done_on is not None:
+        t["done_on"] = done_on
+    return t
 
 
 def state(**kw):
@@ -249,6 +252,7 @@ class Display(unittest.TestCase):
         with mock.patch.object(todoit, "put") as put:
             todoit.draw(scr, state(), 0, at(28, 16, 0))
         calls = [c.args for c in put.call_args_list]
+        self.assertIn("0/0 today", [c[3] for c in calls])
         self.assertIn(" WEEKLY 0/0 ", [c[3] for c in calls])
         self.assertIn("nothing here, press w to add", [c[3] for c in calls])
         note = " resets mondays "
@@ -257,13 +261,31 @@ class Display(unittest.TestCase):
     def test_momentum_splits_due_today_from_overdue(self):
         s = state(daily=[task("done", "09:00", done=True), task("missed", "12:00"), task("later", "18:00")],
                   todo=[task("late", "2026-09-27 17:00"), task("tonight", "2026-09-28 20:00"),
-                        task("next week", "2026-10-05 17:00"), task("early", "2026-10-05 17:00", done=True)])
-        self.assertEqual(todoit.momentum(s, at(28, 16, 0)), (2, 7, 2, 2))
+                        task("next week", "2026-10-05 17:00"),
+                        task("early", "2026-10-05 17:00", done=True, done_on="2026-09-28"),
+                        task("legacy", "2026-10-05 17:00", done=True)])
+        self.assertEqual(todoit.momentum(s, at(28, 16, 0)), (2, 6, 2, 2))
         self.assertEqual(todoit.momentum(state(), at(28, 16, 0)), (0, 0, 0, 0))
 
     def test_momentum_counts_weeklies(self):
-        s = state(weekly=[task("done", "fri 17:00", done=True), task("missed", "mon 09:00")])
+        s = state(weekly=[task("done", "fri 17:00", done=True), task("missed", "mon 09:00"),
+                          task("today", "mon 17:00", done=True)])
         self.assertEqual(todoit.momentum(s, at(28, 16, 0)), (1, 2, 0, 1))
+        for due, done, done_on, want in [
+            ("wed 17:00", False, None, (0, 1, 1, 0)),
+            ("mon 17:00", True, "2026-09-28", (0, 0, 0, 0)),
+            ("mon 17:00", True, "2026-09-30", (1, 1, 0, 0)),
+            ("mon 17:00", False, None, (0, 1, 0, 1)),
+            ("fri 17:00", False, None, (0, 0, 0, 0)),
+            ("fri 17:00", True, "2026-09-30", (1, 1, 0, 0)),
+        ]:
+            self.assertEqual(todoit.momentum(state(weekly=[task("weekly", due, done, done_on=done_on)]),
+                                             at(30, 12, 0)), want)
+        s = state(weekly=[task("late", "mon 09:00")])
+        self.assertEqual(todoit.momentum(s, at(30, 12, 0)), (0, 1, 0, 1))
+        s["weekly"][0]["done"] = True
+        s["weekly"][0]["done_on"] = "2026-09-30"
+        self.assertEqual(todoit.momentum(s, at(30, 12, 0)), (1, 1, 0, 0))
 
     def test_shimmer_stays_on_the_filled_part_of_the_bar(self):
         scr = mock.Mock(**{"getmaxyx.return_value": (20, 90)})  # bar 30 wide
@@ -411,7 +433,10 @@ class Agent(unittest.TestCase):
         with TemporaryDirectory() as d, mock.patch.object(todoit, "DB", Path(d) / "tasks.json"), \
                 mock.patch.object(todoit, "now", return_value=at(28, 19, 0)):
             todoit.save(s)
-            self.assertTrue(todoit.apply_ops(s, [op])["todo"][0]["done"])
+            applied = todoit.apply_ops(s, [op])
+            self.assertTrue(applied["todo"][0]["done"])
+            self.assertEqual(applied["todo"][0]["done_on"], "2026-09-28")
+            self.assertEqual(todoit.momentum(applied, at(28, 19, 0)), (1, 1, 0, 0))
 
     def test_propose_returns_call_errors(self):
         good = {"op": "add", "kind": "daily", "title": "good", "due": "9:00"}
