@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""todoit: daily + ad-hoc todo TUI with macOS banner reminders.
+"""todoit: daily, weekly + ad-hoc todo TUI with macOS banner reminders.
 
     todoit          open the TUI
     todoit notify   send due-soon / missed banners (launchd runs this every 5 min)
@@ -27,12 +27,12 @@ DEFAULT_AGENT = ["claude", "-p", "--model", "claude-sonnet-5-5", "--tools", "", 
                  "--strict-mcp-config", "--setting-sources", ""]
 HEADS_UP = timedelta(minutes=30)
 DEFAULT_TIME = "17:00"
-KINDS = ("daily", "todo")
+KINDS = ("daily", "weekly", "todo")
 DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 LINK = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
 URL = re.compile(r"https?://[^\s)]+")
-HINT = {"daily": "due HH:MM", "todo": "due today|tomorrow|+N|fri|MM-DD|YYYY-MM-DD [HH:MM]"}
-HELP = "space done  a add todo  r add daily  e edit  d delete  o open link  c chat  j/k move  q quit"
+HINT = {"daily": "due HH:MM", "weekly": "due DAY [HH:MM]", "todo": "due today|tomorrow|+N|fri|MM-DD|YYYY-MM-DD [HH:MM]"}
+HELP = "space done a/r/w add todo/daily/weekly  e edit  d del  o link  c chat  q quit"
 CHEERS = ("nice.", "crushed it.", "one down.", "boom.", "look at you go.", "chef's kiss.", "shipped.", "unstoppable.")
 G, DRAG = 0.05, 0.92  # particle gravity (rows/frame^2) and air drag; tune to taste
 RED, YELLOW, GREEN, CYAN, MAGENTA, BLUE = range(1, 7)
@@ -51,7 +51,7 @@ def plain(title):
 # ---------- model ----------
 
 def parse_due(kind, raw, today):
-    """User input -> 'HH:MM' (daily) or 'YYYY-MM-DD HH:MM' (todo). Raises ValueError/OverflowError."""
+    """User input -> 'HH:MM' (daily), 'ddd HH:MM' (weekly), or 'YYYY-MM-DD HH:MM' (todo). Raises ValueError/OverflowError."""
     parts = raw.lower().split()
     if not parts:
         raise ValueError("due date required")
@@ -61,6 +61,11 @@ def parse_due(kind, raw, today):
         if parts or not has_time:
             raise ValueError("daily tasks take HH:MM")
         return hhmm
+    if kind == "weekly":
+        word = " ".join(parts)
+        if len(word) < 3 or not any(day.startswith(word) for day in DAYS):
+            raise ValueError("weekly tasks take a weekday")
+        return f"{next(day[:3] for day in DAYS if day.startswith(word))} {hhmm}"
     word = " ".join(parts) or "today"
     if word == "today":
         d = today
@@ -83,12 +88,17 @@ def parse_due(kind, raw, today):
 def due_at(kind, task, today):
     if kind == "daily":
         return datetime.combine(today, datetime.strptime(task["due"], "%H:%M").time())
+    if kind == "weekly":
+        day, hhmm = task["due"].split()
+        wd = next(i for i, name in enumerate(DAYS) if name.startswith(day))
+        monday = today - timedelta(days=today.weekday())
+        return datetime.combine(monday + timedelta(days=wd), datetime.strptime(hhmm, "%H:%M").time())
     return datetime.strptime(task["due"], "%Y-%m-%d %H:%M")
 
 
 def fresh_sent(kind, due, t):
-    """`sent` for a newly set due. A daily set after today's due time stays quiet until tomorrow."""
-    return ["soon", "missed"] if kind == "daily" and t >= due_at(kind, {"due": due}, t.date()) else []
+    """`sent` for a new due. Daily/weekly slots already past stay quiet until the next reset."""
+    return ["soon", "missed"] if kind != "todo" and t >= due_at(kind, {"due": due}, t.date()) else []
 
 
 def notify(title, body, sound):
@@ -103,24 +113,27 @@ def notify(title, body, sound):
 
 
 def rollover(s, t):
-    """Midnight reset: flag unfinished dailies as missed, uncheck them, drop finished todos."""
+    """Reset dailies at midnight and weeklies on Monday; drop finished todos."""
     today = t.date().isoformat()
     if s["last_reset"] >= today:  # >= so a clock stepping backwards can't re-run it
         return False
-    for task in s["daily"]:
-        if not task["done"] and "missed" not in task["sent"]:  # due 23:59, or the Mac slept through it
-            notify(f"❌ missed · was due {task['due']}", plain(task["title"]), "Basso")
-        task["done"], task["sent"] = False, []
+    new_week = date.fromisoformat(s["last_reset"]).isocalendar()[:2] != t.date().isocalendar()[:2]
+    for kind in (("daily", "weekly") if new_week else ("daily",)):
+        for task in s[kind]:
+            if not task["done"] and "missed" not in task["sent"]:  # due 23:59, or the Mac slept through it
+                when = task["due"].capitalize() if kind == "weekly" else task["due"]
+                notify(f"❌ missed · was due {when}", plain(task["title"]), "Basso")
+            task["done"], task["sent"] = False, []
     purged = [x["title"] for x in s["todo"] if x["done"]]
     s["todo"] = [x for x in s["todo"] if not x["done"]]
-    log.info("rollover %s -> %s: reset %d dailies, purged done todos %s",
-             s["last_reset"], today, len(s["daily"]), purged)
+    log.info("rollover %s -> %s: reset %d dailies, %d weeklies, purged done todos %s",
+             s["last_reset"], today, len(s["daily"]), len(s["weekly"]) if new_week else 0, purged)
     s["last_reset"] = today
     return True
 
 
 def check(s, t):
-    """Send each task's heads-up and missed banner at most once (dailies re-arm at midnight)."""
+    """Send each banner at most once (dailies re-arm at midnight, weeklies on Monday)."""
     for kind in KINDS:
         for task in s[kind]:
             due = due_at(kind, task, t.date())
@@ -142,8 +155,9 @@ def load():
         s = json.loads(DB.read_text())
     except FileNotFoundError:
         log.info("no %s yet, starting empty", DB)
-        s = {"last_reset": t.date().isoformat(), "daily": [], "todo": []}
+        s = {"last_reset": t.date().isoformat(), "daily": [], "weekly": [], "todo": []}
         save(s)
+    s.setdefault("weekly", [])
     if rollover(s, t):
         save(s)
     return s
@@ -183,14 +197,15 @@ def agent_prompt(s, turns, message):
     return (
         "You help change a todo list. You have no tools; the app applies changes after user confirmation.\n"
         "daily repeats every day, due HH:MM, and is unchecked at midnight. "
+        "weekly repeats every week, due ddd HH:MM (e.g. fri 09:00), and is unchecked on Mondays. "
         "todo is one-off, due YYYY-MM-DD HH:MM (17:00 if the user gives no time), and done todos are purged at midnight. "
         "Titles may contain markdown links [text](url). Indices i refer to the tasks shown.\n"
         "Reply with ONLY a JSON object: "
         '{"reply":"short message to the user","ops":['
-        '{"op":"add","kind":"todo|daily","title":"...","due":"..."},'
-        '{"op":"edit","kind":"todo|daily","i":0,"title":"...","due":"...","done":true},'
-        '{"op":"delete","kind":"todo|daily","i":0}]}. '
-        "kind is either todo or daily. For edit, include only fields to change. "
+        '{"op":"add","kind":"todo|daily|weekly","title":"...","due":"..."},'
+        '{"op":"edit","kind":"todo|daily|weekly","i":0,"title":"...","due":"...","done":true},'
+        '{"op":"delete","kind":"todo|daily|weekly","i":0}]}. '
+        "kind is todo, daily or weekly. For edit, include only fields to change. "
         "Use ops: [] when just answering.\n"
         f"Local time: {now():%Y-%m-%d %H:%M %A}\n"
         f"Tasks: {json.dumps(tasks, ensure_ascii=False)}\n"
@@ -353,6 +368,8 @@ def label(kind, task, t):
     days = (due.date() - t.date()).days
     if kind == "daily":
         text = task["due"]
+    elif kind == "weekly":
+        text = f"{due:%a} {due:%H:%M}"
     else:
         day = {0: "today", 1: "tomorrow"}.get(days) or (f"{due:%a}" if 1 < days < 7 else f"{due:%-m/%-d}")
         text = f"{day} {due:%H:%M}"
@@ -360,13 +377,13 @@ def label(kind, task, t):
         return text, C(GREEN) | curses.A_DIM
     if t >= due:
         return ("OVERDUE " if kind == "todo" else "missed ") + text, C(RED) | curses.A_BOLD
-    if t >= due - HEADS_UP or (kind == "todo" and days == 0):
+    if t >= due - HEADS_UP or (kind != "daily" and days == 0):
         return text, C(YELLOW)
     return text, curses.A_DIM
 
 
 def momentum(s, t):
-    """(done, total, due later today, overdue). Checked todos linger until midnight, so done ~= done today."""
+    """(done, total, due later today, overdue). Done weeklies stay counted until Monday."""
     tasks = [(k, x) for k in KINDS for x in s[k]]
     dues = [due_at(k, x, t.date()) for k, x in tasks if not x["done"]]
     return (sum(x["done"] for _, x in tasks), len(tasks),
@@ -410,11 +427,12 @@ def draw(scr, s, cur, t):
         tasks = s[kind]
         put(scr, y, 1, "─" * (w - 2), C(CYAN) | curses.A_DIM)
         put(scr, y, 2, f" {kind.upper()} {sum(x['done'] for x in tasks)}/{len(tasks)} ", C(CYAN) | curses.A_BOLD)
-        if kind == "daily":
-            put(scr, y, w - 21, " resets at midnight ", C(CYAN) | curses.A_DIM)
+        note = {"daily": " resets at midnight ", "weekly": " resets mondays "}.get(kind)
+        if note:
+            put(scr, y, w - len(note) - 1, note, C(CYAN) | curses.A_DIM)
         y += 1
         if not tasks:
-            put(scr, y, 4, f"nothing here, press {'r' if kind == 'daily' else 'a'} to add", curses.A_DIM)
+            put(scr, y, 4, f"nothing here, press {dict(daily='r', weekly='w', todo='a')[kind]} to add", curses.A_DIM)
             y += 1
         for task in tasks:
             sel = len(ys) == cur
@@ -551,7 +569,8 @@ def play(scr, s, cur, frames, fx):
 def celebrate(scr, s, cur, kind, i, y):
     h, w = scr.getmaxyx()
     if all(x["done"] for x in s[kind]):
-        text = " ✦ ALL DAILIES DONE ✦ " if kind == "daily" else " ✦ TODO LIST CLEARED ✦ "
+        text = {"daily": " ✦ ALL DAILIES DONE ✦ ", "weekly": " ✦ ALL WEEKLIES DONE ✦ ",
+                "todo": " ✦ TODO LIST CLEARED ✦ "}[kind]
 
         def fx(f, ps):
             if f % 8 == 0 and f < 64:
@@ -670,15 +689,15 @@ def tui(scr):
             cur -= 1
         elif ch == ord("c"):
             chat(scr, cur)
-        elif ch in (ord("a"), ord("r")):
-            kind = "todo" if ch == ord("a") else "daily"
+        elif ch in (ord("a"), ord("r"), ord("w")):
+            kind = {ord("a"): "todo", ord("r"): "daily", ord("w"): "weekly"}[ch]
             got = ask_task(scr, kind)
             if got:
                 s = load()
                 s[kind].append({"title": got[0], "due": got[1], "done": False, "sent": fresh_sent(kind, got[1], now())})
                 save(s)
                 log.info("added %s: %s (due %s)", kind, *got)
-                cur = len(s["daily"]) - 1 + (len(s["todo"]) if kind == "todo" else 0)
+                cur = sum(len(s[k]) for k in KINDS[:KINDS.index(kind) + 1]) - 1
         elif rows:
             kind, i = rows[cur]
             task = s[kind][i]
