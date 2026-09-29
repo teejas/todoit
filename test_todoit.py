@@ -19,7 +19,7 @@ def task(title, due, done=False, sent=None):
 
 
 def state(**kw):
-    return {"last_reset": "2026-09-28", "daily": [], "todo": [], **kw}
+    return {"last_reset": "2026-09-28", "daily": [], "weekly": [], "todo": [], **kw}
 
 
 class ParseDue(unittest.TestCase):
@@ -27,6 +27,10 @@ class ParseDue(unittest.TestCase):
         for kind, raw, want in [
             ("daily", "17:00", "17:00"),
             ("daily", "9:05", "09:05"),
+            ("weekly", "fri", "fri 17:00"),
+            ("weekly", "Monday 9:05", "mon 09:05"),
+            ("weekly", "thurs 8:00", "thu 08:00"),
+            ("weekly", "fri 17:00", "fri 17:00"),  # stored format round-trips (edit)
             ("todo", "tomorrow", "2026-09-29 17:00"),
             ("todo", "today 9:30", "2026-09-28 09:30"),
             ("todo", "15:00", "2026-09-28 15:00"),
@@ -47,6 +51,15 @@ class ParseDue(unittest.TestCase):
                           ("todo", "fri 9am"), ("todo", "month"), ("todo", "sunset"), ("todo", "sat next week")]:
             with self.assertRaises(ValueError, msg=raw):
                 todoit.parse_due(kind, raw, MON)
+        for raw in ("", "17:00", "today", "tomorrow", "+3", "12-25", "2026-10-15",
+                    "fri 9am", "sat next week", "mo"):
+            with self.assertRaises(ValueError, msg=raw):
+                todoit.parse_due("weekly", raw, MON)
+
+    def test_weekly_due_is_this_iso_week(self):
+        task_ = task("review", "fri 17:00")
+        self.assertEqual(todoit.due_at("weekly", task_, MON), datetime(2026, 10, 2, 17, 0))
+        self.assertEqual(todoit.due_at("weekly", task_, date(2026, 10, 4)), datetime(2026, 10, 2, 17, 0))
 
 
 class Banners(unittest.TestCase):
@@ -57,6 +70,19 @@ class Banners(unittest.TestCase):
 
     def test_heads_up_then_missed_each_once(self):
         s = state(daily=[task("review a PR", "17:00")])
+        todoit.check(s, at(28, 16, 0))
+        self.notify.assert_not_called()
+        todoit.check(s, at(28, 16, 31))
+        todoit.check(s, at(28, 16, 36))
+        self.assertEqual(self.notify.call_count, 1)
+        self.assertEqual(self.notify.call_args.args[:2], ("⏰ due 17:00", "review a PR"))
+        todoit.check(s, at(28, 17, 2))
+        todoit.check(s, at(28, 17, 7))
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertIn("missed", self.notify.call_args.args[0])
+
+    def test_weekly_heads_up_then_missed_each_once(self):
+        s = state(weekly=[task("review a PR", "mon 17:00")])
         todoit.check(s, at(28, 16, 0))
         self.notify.assert_not_called()
         todoit.check(s, at(28, 16, 31))
@@ -86,12 +112,33 @@ class Banners(unittest.TestCase):
                   todo=[task("finished", "2026-09-30 17:00", done=True), task("open", "2026-09-30 17:00")])
         self.assertTrue(todoit.rollover(s, at(29, 0, 2)))
         self.notify.assert_called_once()  # only "late": its 23:59 due fell between notifier runs
-        self.assertEqual(self.notify.call_args.args[1], "late")
+        self.assertEqual(self.notify.call_args.args[:2], ("❌ missed · was due 23:59", "late"))
         self.assertEqual([(t["done"], t["sent"]) for t in s["daily"]], [(False, [])] * 3)
         self.assertEqual([t["title"] for t in s["todo"]], ["open"])
         self.assertEqual(s["last_reset"], "2026-09-29")
         self.assertFalse(todoit.rollover(s, at(29, 9, 0)))  # same day: no-op
         self.assertFalse(todoit.rollover(s, at(28, 23, 0)))  # clock stepped backwards: no-op
+
+    def test_weekly_rollover_on_monday_flags_unsent_misses(self):
+        s = state(last_reset="2026-10-04", weekly=[task("late", "sun 23:59"),
+                  task("warned", "fri 17:00", sent=["missed"]), task("done", "mon 17:00", done=True)])
+        self.assertTrue(todoit.rollover(s, datetime(2026, 10, 5, 0, 2)))
+        self.notify.assert_called_once()
+        self.assertEqual(self.notify.call_args.args[:2], ("❌ missed · was due Sun 23:59", "late"))
+        self.assertEqual([(t["done"], t["sent"]) for t in s["weekly"]], [(False, [])] * 3)
+        self.assertEqual(s["last_reset"], "2026-10-05")
+
+    def test_weekly_stays_checked_within_week(self):
+        s = state(last_reset="2026-09-29", weekly=[task("done", "fri 17:00", done=True, sent=["soon"])])
+        self.assertTrue(todoit.rollover(s, datetime(2026, 9, 30, 0, 2)))
+        self.assertTrue(s["weekly"][0]["done"])
+        self.assertEqual(s["weekly"][0]["sent"], ["soon"])
+        self.notify.assert_not_called()
+
+    def test_weekly_rollover_after_multi_week_gap(self):
+        s = state(weekly=[task("done", "fri 17:00", done=True)])
+        self.assertTrue(todoit.rollover(s, datetime(2026, 10, 20, 10, 0)))
+        self.assertFalse(s["weekly"][0]["done"])
 
     def test_daily_added_after_its_time_stays_quiet_until_tomorrow(self):
         self.assertEqual(todoit.fresh_sent("daily", "17:00", at(28, 19, 0)), ["soon", "missed"])
@@ -101,6 +148,10 @@ class Banners(unittest.TestCase):
         todoit.check(s, at(28, 19, 5))
         todoit.rollover(s, at(29, 0, 1))
         self.notify.assert_not_called()
+
+    def test_weekly_added_after_its_slot_stays_quiet_until_monday(self):
+        self.assertEqual(todoit.fresh_sent("weekly", "mon 09:00", at(28, 10, 0)), ["soon", "missed"])
+        self.assertEqual(todoit.fresh_sent("weekly", "fri 17:00", at(28, 10, 0)), [])
 
 
 class Osascript(unittest.TestCase):
@@ -161,8 +212,28 @@ class Display(unittest.TestCase):
             ("daily", task("a", "12:00"), "missed 12:00"),
             ("daily", task("a", "12:00", done=True), "12:00"),
             ("daily", task("a", "17:00"), "17:00"),
+            ("weekly", task("a", "fri 17:00"), "Fri 17:00"),
+            ("weekly", task("a", "mon 09:00"), "missed Mon 09:00"),
         ]:
             self.assertEqual(todoit.label(kind, t_, t)[0], want)
+
+    def test_weekly_label_colors(self):
+        with mock.patch.object(todoit, "C", side_effect=lambda n: n):
+            self.assertEqual(todoit.label("weekly", task("a", "mon 17:00"), at(28, 16, 0))[1], todoit.YELLOW)
+            self.assertEqual(todoit.label("weekly", task("a", "mon 09:00"), at(28, 16, 0))[1],
+                             todoit.RED | todoit.curses.A_BOLD)
+            self.assertEqual(todoit.label("weekly", task("a", "fri 17:00", done=True), at(28, 16, 0))[1],
+                             todoit.GREEN | todoit.curses.A_DIM)
+
+    def test_draw_weekly_section_and_empty_hint(self):
+        scr = mock.Mock(**{"getmaxyx.return_value": (20, 90)})
+        with mock.patch.object(todoit, "put") as put:
+            todoit.draw(scr, state(), 0, at(28, 16, 0))
+        calls = [c.args for c in put.call_args_list]
+        self.assertIn(" WEEKLY 0/0 ", [c[3] for c in calls])
+        self.assertIn("nothing here, press w to add", [c[3] for c in calls])
+        note = " resets mondays "
+        self.assertTrue(any(c[2:4] == (90 - len(note) - 1, note) for c in calls))
 
     def test_momentum_splits_due_today_from_overdue(self):
         s = state(daily=[task("done", "09:00", done=True), task("missed", "12:00"), task("later", "18:00")],
@@ -170,6 +241,10 @@ class Display(unittest.TestCase):
                         task("next week", "2026-10-05 17:00"), task("early", "2026-10-05 17:00", done=True)])
         self.assertEqual(todoit.momentum(s, at(28, 16, 0)), (2, 7, 2, 2))
         self.assertEqual(todoit.momentum(state(), at(28, 16, 0)), (0, 0, 0, 0))
+
+    def test_momentum_counts_weeklies(self):
+        s = state(weekly=[task("done", "fri 17:00", done=True), task("missed", "mon 09:00")])
+        self.assertEqual(todoit.momentum(s, at(28, 16, 0)), (1, 2, 0, 1))
 
     def test_shimmer_stays_on_the_filled_part_of_the_bar(self):
         scr = mock.Mock(**{"getmaxyx.return_value": (20, 90)})  # bar 30 wide
@@ -202,6 +277,14 @@ class Store(unittest.TestCase):
             todoit.save(s)
             self.assertEqual(todoit.load(), s)
             self.assertEqual(list(todoit.DB.parent.glob("*.tmp")), [])
+
+    def test_load_legacy_store_without_weekly(self):
+        with TemporaryDirectory() as d, mock.patch.object(todoit, "DB", Path(d) / "tasks.json"), \
+                mock.patch.object(todoit, "now", return_value=at(28, 10, 0)):
+            old = state(last_reset="2026-09-27")
+            old.pop("weekly")
+            todoit.save(old)
+            self.assertEqual(todoit.load()["weekly"], [])
 
     def test_reload_refuses_write_after_midnight_reshuffle(self):
         with TemporaryDirectory() as d, mock.patch.object(todoit, "DB", Path(d) / "tasks.json"), \
