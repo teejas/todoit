@@ -220,10 +220,13 @@ def label(kind, task, t):
 
 
 def momentum(s, t):
-    """(done, total, due later today, overdue). Done weeklies stay counted until Monday."""
-    tasks = [(k, x) for k in KINDS for x in s[k]]
-    dues = [due_at(k, x, t.date()) for k, x in tasks if not x["done"]]
-    return (sum(x["done"] for _, x in tasks), len(tasks),
+    """(done, total, due later today, overdue); done/total cover today's plate."""
+    tasks = [(k, x, due_at(k, x, t.date())) for k in KINDS for x in s[k]]
+    plate = [x for k, x, d in tasks
+             if d.date() == t.date() or (not x["done"] and t >= d)
+             or (x["done"] and x.get("done_on") == t.date().isoformat())]
+    dues = [d for _, x, d in tasks if not x["done"]]
+    return (sum(x["done"] for x in plate), len(plate),
             sum(t < d and d.date() == t.date() for d in dues), sum(t >= d for d in dues))
 
 
@@ -255,7 +258,7 @@ def draw(scr, s, cur, t):
     put(scr, 1, 1, "MOMENTUM", C(MAGENTA) | curses.A_BOLD)
     put(scr, 1, BAR_X, "━" * fill, C(GREEN) | curses.A_BOLD)
     put(scr, 1, BAR_X + fill, "━" * (bar - fill), curses.A_DIM)
-    put(scr, 1, BAR_X + bar + 1, f"{done}/{total} done", curses.A_BOLD)
+    put(scr, 1, BAR_X + bar + 1, f"{done}/{total} today", curses.A_BOLD)
     stats = f"{today} due today · {overdue} overdue"
     put(scr, 1, w - len(stats) - 1, stats, C(RED) | curses.A_BOLD if overdue else curses.A_DIM)
     y, ys = 3, []
@@ -464,6 +467,8 @@ def tui(scr):
                 if s:
                     task = s[kind][i]
                     task["done"] = not task["done"]
+                    if task["done"]:
+                        task["done_on"] = now().date().isoformat()
                     save(s)
                     log.info("%s: %s", "done" if task["done"] else "undone", task["title"])
                     if task["done"]:
