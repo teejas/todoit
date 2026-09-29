@@ -323,6 +323,8 @@ def apply_ops(s, ops):
         task = fresh[op["kind"]][op["i"]]
         if "due" in op and op["due"] != task["due"]:
             task["sent"] = fresh_sent(op["kind"], op["due"], now())
+        if op.get("done") and not task["done"]:
+            task["done_on"] = now().date().isoformat()
         task.update({k: v for k, v in op.items() if k in ("title", "due", "done")})
         log.info("agent edited %s: %s (due %s)", op["kind"], task["title"], task["due"])
     for op in sorted((x for x in ops if x["op"] == "delete"), key=lambda x: x["i"], reverse=True):

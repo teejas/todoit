@@ -433,7 +433,10 @@ class Agent(unittest.TestCase):
         with TemporaryDirectory() as d, mock.patch.object(todoit, "DB", Path(d) / "tasks.json"), \
                 mock.patch.object(todoit, "now", return_value=at(28, 19, 0)):
             todoit.save(s)
-            self.assertTrue(todoit.apply_ops(s, [op])["todo"][0]["done"])
+            applied = todoit.apply_ops(s, [op])
+            self.assertTrue(applied["todo"][0]["done"])
+            self.assertEqual(applied["todo"][0]["done_on"], "2026-09-28")
+            self.assertEqual(todoit.momentum(applied, at(28, 19, 0)), (1, 1, 0, 0))
 
     def test_propose_returns_call_errors(self):
         good = {"op": "add", "kind": "daily", "title": "good", "due": "9:00"}
