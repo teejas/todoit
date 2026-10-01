@@ -9,13 +9,13 @@ make install    # symlink ~/.local/bin/todoit + load the launchd notifier (every
 make uninstall  # stop banners, remove symlink (keeps ~/.todoit/tasks.json)
 ```
 
-**Keys:** `space`/`x` done · `a` add todo · `r` add daily · `w` add weekly · `e` edit · `d` delete · `o` open link · `c` chat · `j`/`k` move · `q` quit
+**Keys:** `space`/`x` done · `a` add todo · `r` add daily · `w` add weekly · `e` edit · `d` delete · `o` open link · `c` spawn agent · `j`/`k` move · `q` quit
 
 **Due formats:** daily `HH:MM`. Weekly `DAY [HH:MM]` (default 17:00). Todo `today|tomorrow|+N|fri|MM-DD|YYYY-MM-DD` plus optional `HH:MM` (default 17:00).
 
 **Banners:** `⏰` 30 min before due, `❌` once it's past due. Each fires once per task; dailies re-arm at midnight, weeklies on Monday, editing a due time re-arms it.
 Sent via `osascript`, so macOS lists them under **Script Editor**: System Settings → Notifications → Script Editor → allow, style *Banners*.
-Log: `~/.todoit/todoit.log` (banners sent/failed, midnight resets, adds/edits/deletes). Crash tracebacks: `~/.todoit/notify.log`.
+Log: `~/.todoit/todoit.log` (banners sent/failed, midnight resets, adds/edits/deletes, agent spawns). Crash tracebacks: `~/.todoit/notify.log`.
 Set `TODOIT_HOME` to use a different data dir (re-run `make install` so the notifier follows).
 
-**Agent:** Press `c` to ask for list changes. The default command is `claude -p --model claude-sonnet-5-5 --tools '' --no-session-persistence --strict-mcp-config --setting-sources ''`. The last two flags keep your plugins, hooks and MCP servers out of the call; with them loaded, each turn sends ~230K+ tokens and takes ~9s instead of ~3.5s. Set `{"agent": ["codex", "exec", "-"]}` in `$TODOIT_HOME/config.json` (or `~/.todoit/config.json`) to use another stdin-reading CLI. The agent has no tools; every batch of changes needs your confirmation.
+**Agent:** Press `c` on a task to spawn a coding agent on it. Todoit must run inside herdr (`HERDR_ENV=1`), otherwise it shows `✗ needs herdr`. Pick an open herdr workspace (type to filter; todoit never creates workspaces, so open one in herdr first). A repo's main-checkout workspace offers a new tab in it or a new worktree off it (branch prefilled from the title, created next to the checkout: `~/vapi/repo/main` → `~/vapi/repo/<branch>`); other worktrees and non-git workspaces get a new tab (herdr only creates worktrees from the repo's main workspace). Then pick a harness (claude/codex/opencode), a model (presets or `other…`), and a prompt drafted by `claude -p --model claude-sonnet-5-5 --tools '' --no-session-persistence --strict-mcp-config --setting-sources ''`. The last two flags keep your plugins, hooks and MCP servers out of the call; with them loaded, each turn sends ~230K+ tokens and takes ~9s instead of ~3.5s. Enter accepts the suggestion, typing replaces it, and Esc cancels at any step. The agent starts in the new tab's or worktree's pane with the prompt; focus stays in todoit.
