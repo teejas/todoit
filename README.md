@@ -9,7 +9,7 @@ make install    # symlink ~/.local/bin/todoit + load the launchd notifier (every
 make uninstall  # stop banners, remove symlink (keeps ~/.todoit/tasks.json)
 ```
 
-**Keys:** `space`/`x` done · `a` add todo · `r` add daily · `w` add weekly · `e` edit · `d` delete · `o` open link · `c` spawn agent · `j`/`k` move · `q` quit · in prompts: `esc` clear · `esc esc` cancel · `⌥⌫` delete word · adding/editing a task: `esc` on an empty title cancels, on an empty due goes back to the title
+**Keys:** `space`/`x` done · `a` add todo · `r` add daily · `w` add weekly · `e` edit · `d` delete · `o` open link · `c` spawn agent · `j`/`k` move · `⇧↑`/`⇧↓` section jump · `/` search · `n` next match · `q` quit · in prompts: `esc` clear · `esc esc` cancel · `⌥⌫` delete word · adding/editing a task: `esc` on an empty title cancels, on an empty due goes back to the title
 
 **Due formats:** daily `HH:MM`. Weekly `DAY [HH:MM]` (default 17:00). Todo `today|tomorrow|+N|fri|MM-DD|YYYY-MM-DD` plus optional `HH:MM` (default 17:00).
 

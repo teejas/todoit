@@ -394,6 +394,27 @@ class Display(unittest.TestCase):
         self.assertFalse(any(p[6] for p in ps))
 
 
+class Navigation(unittest.TestCase):
+    def test_section_start(self):
+        rows = [("daily", 0), ("daily", 1), ("weekly", 0), ("todo", 0), ("todo", 1), ("todo", 2)]
+        skip = rows[:2] + rows[3:]
+        for rs, down, want in [(rows, True, [2, 2, 3, 5, 5, 5]), (rows, False, [0, 0, 0, 2, 3, 3]),
+                               (skip, True, [2, 2, 4, 4, 4]), (skip, False, [0, 0, 0, 2, 2]),
+                               ([], True, [0]), ([], False, [0])]:
+            for cur, n in enumerate(want):
+                self.assertEqual(todoit.section_start(rs, cur, down), n, (rs, cur, down))
+
+    def test_find(self):
+        s = state(daily=[task("walk", "09:00"), task("Review [PR 41](https://x.io/hidden)", "17:00")],
+                  weekly=[task("review PR notes", "fri 17:00")], todo=[task("last", "2026-09-30 17:00")])
+        rows = [("daily", 0), ("daily", 1), ("weekly", 0), ("todo", 0)]
+        for rs, cur, q, want in [(rows, 3, "WALK", 0), (rows, 1, "PR 41", 1),
+                                (rows, 1, " review pR ", 2), (rows, 2, "pR REView", 1),
+                                (rows, 0, "41 revIEw", 1), (rows, 0, "hidden", None),
+                                (rows, 0, "https", None), (rows, 0, "missing", None), ([], 0, "walk", None)]:
+            self.assertEqual(todoit.find(s, rs, cur, q), want, (rs, cur, q))
+
+
 class Store(unittest.TestCase):
     def test_first_run_then_round_trip(self):
         with TemporaryDirectory() as d, mock.patch.object(todoit, "DB", Path(d) / "new" / "tasks.json"), \

@@ -35,7 +35,7 @@ DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sun
 LINK = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
 URL = re.compile(r"https?://[^\s)]+")
 HINT = {"daily": "due HH:MM", "weekly": "due DAY [HH:MM]", "todo": "due today|tomorrow|+N|fri|MM-DD|YYYY-MM-DD [HH:MM]"}
-HELP = "space done a/r/w add todo/daily/weekly  e edit  d del  o link  c agent  q quit"
+HELP = "space done a/r/w add todo/daily/weekly  e edit  d del  o link  c agent  q quit  / find  ⇧↑↓ section"
 MODELS = {"claude": ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5"],
           "codex": ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-sol"]}
 CHEERS = ("nice.", "crushed it.", "one down.", "boom.", "look at you go.", "chef's kiss.", "shipped.", "unstoppable.")
@@ -51,6 +51,10 @@ def now():
 
 def plain(title):
     return LINK.sub(r"\1", title)
+
+
+def matches(q, text):
+    return all(t in text.lower() for t in q.lower().split())
 
 
 # ---------- model ----------
@@ -571,7 +575,7 @@ def pick(scr, panel, question, items, search=False, default=None):
     scr.timeout(-1)
     try:
         while True:
-            hits = [i for i, x in enumerate(items) if all(t in x.lower() for t in q.lower().split())]
+            hits = [i for i, x in enumerate(items) if matches(q, x)]
             c = max(0, min(c, len(hits) - 1))
             panel([question + (f" {q}_" if search else "")]
                   + [f"{'▸' if n == c else ' '} " + ("" if search else f"{n + 1} ") + items[i] for n, i in enumerate(hits)], c + 1)
@@ -683,6 +687,23 @@ def spawn(scr, s, cur, task):
     return f"→ {harness} · {model} · {where}" + (tilde(cwd) if how == 1 else f'{ws["label"]} (new tab)')
 
 
+def section_start(rows, cur, down):
+    """Next section's start going down; current/previous start going up."""
+    starts = [n for n, (_, i) in enumerate(rows) if i == 0]
+    if down:
+        return next((n for n in starts if n > cur), max(0, len(rows) - 1))
+    return next((n for n in reversed(starts) if n < cur), 0)
+
+
+def find(s, rows, cur, q):
+    """Next matching task, wrapping once; the current row is checked last."""
+    for d in range(1, len(rows) + 1):
+        n = (cur + d) % len(rows)
+        kind, i = rows[n]
+        if matches(q, plain(s[kind][i]["title"])):
+            return n
+
+
 def tui(scr):
     curses.curs_set(0)
     curses.set_escdelay(25)
@@ -691,7 +712,7 @@ def tui(scr):
                                curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_BLUE), 1):
         curses.init_pair(n, color, -1)
     scr.timeout(1000)  # tick every second: clock, due colors, midnight rollover
-    cur, msg = 0, None
+    cur, msg, query = 0, None, ""
     while True:
         s = load()
         rows = [(k, i) for k in KINDS for i in range(len(s[k]))]
@@ -707,6 +728,19 @@ def tui(scr):
             cur += 1
         elif ch in (ord("k"), curses.KEY_UP):
             cur -= 1
+        elif ch in (curses.KEY_SF, curses.KEY_SR):
+            cur = section_start(rows, cur, ch == curses.KEY_SF)
+        elif ch in (ord("/"), ord("n")):
+            # ponytail: searches the list as drawn before the prompt; a midnight rollover mid-typing can land
+            # the cursor on the wrong task (no write). reload s/rows after the prompt if it bites
+            q = prompt(scr, "search: ", esc_empty=True) if ch == ord("/") else query
+            if q:
+                query = q
+                hit = find(s, rows, cur, query)
+                if hit is None:
+                    msg = f"✗ no match: {query}"
+                else:
+                    cur = hit
         elif ch in (ord("a"), ord("r"), ord("w")):
             kind = {ord("a"): "todo", ord("r"): "daily", ord("w"): "weekly"}[ch]
             got = ask_task(scr, kind)
