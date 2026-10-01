@@ -45,7 +45,7 @@ LIST = ok({"workspaces": [{"workspace_id": "wN", "label": "repo",
                           {"workspace_id": "wL", "label": "feat",
                            "worktree": {"checkout_path": FEAT, "is_linked_worktree": True}}]})
 CREATED = ok({"root_pane": {"pane_id": "w9:p1"}, "tab": {"tab_id": "w9:t1"}})
-RAN = ok({"type": "ok"})
+RAN = subprocess.CompletedProcess([], 0, "", "")
 WS_LIST = [["herdr", "workspace", "list"]]
 
 

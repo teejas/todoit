@@ -218,7 +218,7 @@ def herdr(*args):
             detail = r.stderr.strip().splitlines()
             msg = detail[-1] if detail else f"herdr exited {r.returncode}"
         raise RuntimeError(msg)
-    return json.loads(r.stdout).get("result") or {}
+    return (json.loads(r.stdout).get("result") or {}) if r.stdout.strip() else {}
 
 
 # ---------- TUI ----------
