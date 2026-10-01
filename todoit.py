@@ -378,8 +378,8 @@ def draw(scr, s, cur, t, status=None):
     return ys
 
 
-def edit(scr, ch, text, last_esc):
-    """One key of line editing for prompt/pick. Returns (text, last_esc); text None means Esc Esc (cancel)."""
+def edit(scr, ch, text, pos, last_esc):
+    """One key of line editing for prompt/pick. Returns (text, pos, last_esc); text None means Esc Esc (cancel)."""
     if ch == "\x1b":
         scr.timeout(0)
         try:
@@ -387,48 +387,63 @@ def edit(scr, ch, text, last_esc):
         except curses.error:
             t = time.monotonic()
             if last_esc is not None and t - last_esc <= DOUBLE_ESC:
-                return None, None
-            return "", t
+                return None, 0, None
+            return "", 0, t
         else:
             if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
-                text = re.sub(r"\w*\W*$", "", text)
-            return text, None
+                left = re.sub(r"\w*\W*$", "", text[:pos])
+                return left + text[pos:], len(left), None
+            ch = {"b": b"kLFT3", "f": b"kRIT3"}.get(ch)
         finally:
             scr.timeout(-1)
     if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
-        text = text[:-1]
+        if pos:
+            text, pos = text[:pos - 1] + text[pos:], pos - 1
+    elif ch == curses.KEY_LEFT:
+        pos = max(0, pos - 1)
+    elif ch == curses.KEY_RIGHT:
+        pos = min(len(text), pos + 1)
     elif isinstance(ch, str) and ch.isprintable():
-        text += ch
-    return text, None
+        text, pos = text[:pos] + ch + text[pos:], pos + 1
+    else:
+        name = curses.keyname(ch) if isinstance(ch, int) else ch
+        if name == b"kLFT3":
+            pos = len(re.sub(r"\w*\W*$", "", text[:pos]))
+        elif name == b"kRIT3":
+            pos += re.match(r"\W*\w*", text[pos:]).end()
+    return text, pos, None
 
 
-def prompt(scr, label_, text="", keep=None, nav=False, esc_empty=False):
-    """One-line editor. Enter returns stripped text, Esc clears, Esc Esc cancels, Option+Backspace deletes a word.
-    With esc_empty, Esc on an already-empty field returns None at once.
-    With nav, → submits and ← returns BACK, storing the current text in `keep` (a list) if given."""
+def prompt(scr, label_, text="", keep=None, nav=False, esc_empty=False, on_text=None):
+    """Enter submits stripped text, Esc clears, Esc Esc cancels (esc_empty cancels when empty).
+    With nav, ← at start returns BACK (saving keep), → at end submits; on_text(text) runs before each draw."""
     curses.curs_set(1)
     scr.timeout(-1)
-    last_esc = None
+    pos, offset, last_esc = len(text), 0, None
     try:
         while True:
+            if on_text is not None:
+                on_text(text)
             h, w = scr.getmaxyx()
             scr.move(h - 1, 0)
             scr.clrtoeol()
             shown_label = fit(label_, max(0, w - 20))  # always leave room to type
             put(scr, h - 1, 1, shown_label, C(YELLOW) | curses.A_BOLD)
             x = min(len(shown_label) + 1, w - 1)
-            shown = text[-max(1, w - x - 1):]
+            avail = max(1, w - x)
+            offset = min(max(offset, pos - avail + 1), pos)  # scroll only when the cursor would leave the window
+            shown = text[offset:offset + avail]
             put(scr, h - 1, x, shown)
-            scr.move(h - 1, min(x + len(shown), w - 1))
+            scr.move(h - 1, min(x + pos - offset, w - 1))
             ch = scr.get_wch()
-            if ch in ("\n", "\r", curses.KEY_ENTER) or (nav and ch == curses.KEY_RIGHT):
+            if ch in ("\n", "\r", curses.KEY_ENTER) or (nav and ch == curses.KEY_RIGHT and pos == len(text)):
                 return text.strip()
-            if nav and ch == curses.KEY_LEFT:
+            if nav and ch == curses.KEY_LEFT and pos == 0:
                 if keep is not None:
                     keep[:] = [text]
                 return BACK
             was = text
-            text, last_esc = edit(scr, ch, text, last_esc)
+            text, pos, last_esc = edit(scr, ch, text, pos, last_esc)
             if text is None or (esc_empty and last_esc is not None and not was):
                 return None
     finally:
@@ -570,22 +585,22 @@ def pick(scr, panel, question, items, search=False, default=None):
     """Menu starting on `default` (an index into items). Enter/→ picks, ← returns BACK, ↑/↓ move.
     Without search, digits pick and j/k move; Esc does nothing. With search, typed text filters (every
     space-separated term a case-insensitive substring), Esc clears and Option+Backspace deletes a word.
-    Esc Esc cancels in both modes."""
-    c, q, last_esc = default or 0, "", None
+    Esc Esc cancels in both modes. With search, ←/→ leave only at the text edges."""
+    c, q, pos, last_esc = default or 0, "", 0, None
     scr.timeout(-1)
     try:
         while True:
             hits = [i for i, x in enumerate(items) if matches(q, x)]
             c = max(0, min(c, len(hits) - 1))
-            panel([question + (f" {q}_" if search else "")]
+            panel([question + (f" {q[:pos]}_{q[pos:]}" if search else "")]
                   + [f"{'▸' if n == c else ' '} " + ("" if search else f"{n + 1} ") + items[i] for n, i in enumerate(hits)], c + 1)
             ch = scr.get_wch()
             if ch != "\x1b":
                 last_esc = None
-            if ch in ("\n", "\r", curses.KEY_ENTER, curses.KEY_RIGHT):
+            if ch in ("\n", "\r", curses.KEY_ENTER) or (ch == curses.KEY_RIGHT and (not search or pos == len(q))):
                 if hits:
                     return hits[c]
-            elif ch == curses.KEY_LEFT:
+            elif ch == curses.KEY_LEFT and (not search or pos == 0):
                 return BACK
             elif ch == curses.KEY_DOWN or (not search and ch == "j"):
                 c += 1
@@ -594,7 +609,7 @@ def pick(scr, panel, question, items, search=False, default=None):
             elif not search and isinstance(ch, str) and ch in "123456789" and int(ch) <= len(hits):
                 return hits[int(ch) - 1]
             elif search or ch == "\x1b":
-                q, last_esc = edit(scr, ch, q, last_esc)
+                q, pos, last_esc = edit(scr, ch, q, pos, last_esc)
                 if q is None:
                     return None
     finally:
@@ -731,12 +746,22 @@ def tui(scr):
         elif ch in (curses.KEY_SF, curses.KEY_SR):
             cur = section_start(rows, cur, ch == curses.KEY_SF)
         elif ch in (ord("/"), ord("n")):
-            # ponytail: searches the list as drawn before the prompt; a midnight rollover mid-typing can land
-            # the cursor on the wrong task (no write). reload s/rows after the prompt if it bites
-            q = prompt(scr, "search: ", esc_empty=True) if ch == ord("/") else query
+            # ponytail: search keeps a snapshot while typing; rollover can reshuffle it on the next load.
+            # reload s/rows during the prompt if it bites
+            start = cur
+            if ch == ord("/"):
+                def on_text(q):
+                    nonlocal cur
+                    hit = find(s, rows, start, q) if q.strip() else None
+                    cur = start if hit is None else hit
+                    draw(scr, s, cur, now())
+                q = prompt(scr, "search: ", esc_empty=True, on_text=on_text)
+            else:
+                q = query
+            cur = start
             if q:
                 query = q
-                hit = find(s, rows, cur, query)
+                hit = find(s, rows, start, query)
                 if hit is None:
                     msg = f"✗ no match: {query}"
                 else:

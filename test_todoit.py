@@ -248,15 +248,90 @@ class AskTask(unittest.TestCase):
         ])
 
 
+class Edit(unittest.TestCase):
+    def test_chars(self):
+        left, right = todoit.curses.KEY_LEFT, todoit.curses.KEY_RIGHT
+        cases = [("x", 1, "axbc", 2), ("日", 3, "abc日", 4),
+                 (left, 0, "abc", 0), (left, 2, "abc", 1),
+                 (right, 1, "abc", 2), (right, 3, "abc", 3), ("\n", 1, "abc", 1),
+                 (todoit.curses.KEY_F1, 1, "abc", 1)]  # unknown int keys are ignored
+        cases += [(ch, pos, text, want) for ch in ("\x7f", "\b", todoit.curses.KEY_BACKSPACE)
+                  for pos, text, want in [(2, "ac", 1), (0, "abc", 0)]]
+        with mock.patch.object(todoit.curses, "keyname", return_value=b"KEY_F(1)"):
+            for ch, pos, text, want in cases:
+                with self.subTest(ch=ch, pos=pos):
+                    self.assertEqual(todoit.edit(mock.Mock(), ch, "abc", pos, 0), (text, want, None))
+
+    def test_words(self):
+        text = "buy oat-milk later"
+        left = [(0, 0), (4, 0), (8, 4), (12, 8), (18, 13)]
+        right = [(0, 3), (3, 7), (7, 12), (12, 18), (18, 18)]
+        for keys, name, cases in [([1001], b"kLFT3", left), ([1002], b"kRIT3", right),
+                                  (["\x1b", "b"], b"", left), (["\x1b", "f"], b"", right)]:
+            for pos, want in cases:
+                scr = mock.Mock(**{"get_wch.side_effect": keys[1:]})
+                with self.subTest(keys=keys, pos=pos), mock.patch.object(todoit.curses, "keyname", return_value=name):
+                    self.assertEqual(todoit.edit(scr, keys[0], text, pos, 0), (text, want, None))
+                if keys[0] == "\x1b":
+                    self.assertEqual(scr.timeout.call_args_list, [mock.call(0), mock.call(-1)])
+
+    def test_alt_backspace_and_ignored_chords(self):
+        for ch in ("\x7f", "\b", todoit.curses.KEY_BACKSPACE, "x", todoit.curses.KEY_LEFT):
+            for pos in (0, 12):
+                scr = mock.Mock(**{"get_wch.return_value": ch})
+                deleted = ch in ("\x7f", "\b", todoit.curses.KEY_BACKSPACE) and pos
+                want = ("buy oat- later", 8) if deleted else ("buy oat-milk later", pos)
+                with self.subTest(ch=ch, pos=pos), mock.patch.object(todoit.curses, "keyname", return_value=b""):
+                    self.assertEqual(todoit.edit(scr, "\x1b", "buy oat-milk later", pos, 0), (*want, None))
+                self.assertEqual(scr.timeout.call_args_list, [mock.call(0), mock.call(-1)])
+
+    def test_esc(self):
+        for last, t, want in [(None, 0, ("", 0, 0)), (0, 1, ("", 0, 1)), (0, 0.1, (None, 0, None))]:
+            scr = mock.Mock(**{"get_wch.side_effect": todoit.curses.error()})
+            with mock.patch.object(todoit.time, "monotonic", return_value=t):
+                self.assertEqual(todoit.edit(scr, "\x1b", "old", 2, last), want)
+            self.assertEqual(scr.timeout.call_args_list, [mock.call(0), mock.call(-1)])
+
+
 class Prompt(unittest.TestCase):
-    def edit(self, keys, text="", times=(), **kw):
+    def edit(self, keys, text="", times=(), width=80, **kw):
         scr = mock.Mock()
-        scr.getmaxyx.return_value = (5, 80)
+        scr.getmaxyx.return_value = (5, width)
         scr.get_wch.side_effect = keys
         with mock.patch.object(todoit, "C", return_value=0), \
                 mock.patch.object(todoit.curses, "curs_set"), \
+                mock.patch.object(todoit.curses, "keyname", return_value=b""), \
                 mock.patch.object(todoit.time, "monotonic", side_effect=times):
             return todoit.prompt(scr, "title: ", text, **kw), scr
+
+    def test_cursor_and_nav_edges(self):
+        left, right = todoit.curses.KEY_LEFT, todoit.curses.KEY_RIGHT
+        for keys, text, nav, want in [([left, "x", "\n"], "ab", False, "axb"),
+                                     ([left, "x", "\n"], "ab", True, "axb"),
+                                     ([left, left, right, "x", "\n"], "ab", True, "axb"),
+                                     ([right], "ab", True, "ab"), ([left], "", True, todoit.BACK),
+                                     ([left, "x", "\n"], "", False, "x")]:
+            keep = ["saved"]
+            with self.subTest(keys=keys, nav=nav):
+                result, scr = self.edit(keys, text, keep=keep, nav=nav)
+                self.assertEqual(result, want)
+                self.assertEqual(keep, [""] if want is todoit.BACK else ["saved"])
+                scr.timeout.assert_called_with(1000)
+
+    def test_cursor_window(self):
+        text = "0123456789" * 3
+        for n, shown, x in [(0, text[12:], 23), (20, text[10:29], 5), (30, text[:19], 5)]:
+            result, scr = self.edit([todoit.curses.KEY_LEFT] * n + ["\n"], text, width=24)
+            self.assertEqual(result, text)
+            self.assertEqual(scr.addstr.call_args.args[2], shown)
+            scr.move.assert_called_with(4, x)
+
+    def test_on_text_before_draw(self):
+        events = []
+        with mock.patch.object(todoit, "put", side_effect=lambda *args: events.append(None)):
+            result, _ = self.edit([todoit.curses.KEY_LEFT, "x", "\n"], "ab", on_text=events.append)
+        self.assertEqual(result, "axb")
+        self.assertEqual(events, ["ab", None, None, "ab", None, None, "axb", None, None])
 
     def test_word_delete(self):
         for backspace in ("\x7f", "\b", todoit.curses.KEY_BACKSPACE):
@@ -279,6 +354,8 @@ class Prompt(unittest.TestCase):
 
     def test_word_delete_empty(self):
         self.assertEqual(self.edit(["\x1b", "\x7f", "x", "\n"], esc_empty=True)[0], "x")
+        for ch in ("b", "f", "x"):
+            self.assertEqual(self.edit(["\x1b", ch, "x", "\n"], esc_empty=True)[0], "x")
 
     def test_double_esc(self):
         esc = ["\x1b", todoit.curses.error()]
@@ -414,6 +491,39 @@ class Navigation(unittest.TestCase):
                                 (rows, 0, "https", None), (rows, 0, "missing", None), ([], 0, "walk", None)]:
             self.assertEqual(todoit.find(s, rs, cur, q), want, (rs, cur, q))
 
+    def test_live_search(self):
+        s = state(daily=[task("alpha", "09:00"), task("beta", "10:00"), task("alpha two", "11:00")])
+        miss = "✗ no match: zzz"
+        cases = [(0, [(["", "a", "al", "alpha"], "alpha")], "/nq",
+                  [(0, None), (0, None), (1, None), (2, None), (2, None), (2, None), (0, None)]),
+                 (2, [(["alpha"], "alpha")], "/q", [(0, None), (1, None), (2, None), (0, None), (0, None)]),
+                 (1, [(["alpha", "zzz"], "zzz")], "/nq",
+                  [(0, None), (1, None), (2, None), (1, None), (1, miss), (1, miss)]),
+                 (0, [(["alpha"], "alpha"), (["beta"], None)], "//nq",
+                  [(0, None), (2, None), (2, None), (1, None), (2, None), (0, None)]),
+                 (0, [(["alpha"], "alpha"), (["beta", ""], "")], "//nq",
+                  [(0, None), (2, None), (2, None), (1, None), (2, None), (2, None), (0, None)])]
+        for start, answers, keys, want in cases:
+            replies = iter(answers)
+            scr = mock.Mock(**{"getch.side_effect": list(map(ord, "j" * start + keys))})
+
+            def prompt(scr_, label_, esc_empty=False, on_text=None):
+                self.assertEqual((scr_, label_, esc_empty), (scr, "search: ", True))
+                typed, answer = next(replies)
+                for q in typed:
+                    on_text(q)
+                return answer
+
+            with self.subTest(start=start, answers=answers), \
+                    mock.patch.multiple(todoit.curses, curs_set=mock.DEFAULT, set_escdelay=mock.DEFAULT,
+                                        use_default_colors=mock.DEFAULT, init_pair=mock.DEFAULT), \
+                    mock.patch.object(todoit, "load", return_value=s), \
+                    mock.patch.object(todoit, "now", return_value=at(28, 10, 0)), \
+                    mock.patch.object(todoit, "prompt", side_effect=prompt), mock.patch.object(todoit, "draw") as draw:
+                todoit.tui(scr)
+            self.assertEqual([(c.args[2], c.args[4] if len(c.args) > 4 else None) for c in draw.call_args_list], want)
+            self.assertTrue(all(c.args[:2] == (scr, s) and c.args[3] == at(28, 10, 0) for c in draw.call_args_list))
+
 
 class Store(unittest.TestCase):
     def test_first_run_then_round_trip(self):
@@ -499,7 +609,7 @@ class Spawn(unittest.TestCase):
                                            (list("kaf zz") + ["\x1b", "\b", "\n"], 1),
                                            (list("kaf zz") + ["\x1b", todoit.curses.KEY_BACKSPACE, "\n"], 1),
                                            (list("kaf") + ["\x1b", "x", "\n"], 1),
-                                           (list("kaf") + [todoit.curses.KEY_LEFT], todoit.BACK),
+                                           (list("kaf") + [todoit.curses.KEY_LEFT] * 4, todoit.BACK),
                                            (list("kaf") + [todoit.curses.KEY_RIGHT], 1),
                                            (["z", todoit.curses.KEY_RIGHT] + esc + ["\n"], 0)]):
             scr.get_wch.side_effect = keys
@@ -522,9 +632,22 @@ class Spawn(unittest.TestCase):
         scr.get_wch.side_effect = ["\n"]
         self.assertEqual(todoit.pick(scr, panel, "q?", ["a", "b"], default=None), 0)
 
+    def test_pick_search_cursor(self):
+        left, right = todoit.curses.KEY_LEFT, todoit.curses.KEY_RIGHT
+        for keys, want, header in [([left], todoit.BACK, "ws? _"),
+                                   (list("af") + [left, "b", "\n"], 0, "ws? ab_f"),
+                                   (list("af") + [left, right, "b", "\n"], 1, "ws? afb_"),
+                                   (list("af") + [right], 1, "ws? af_")]:
+            scr, panel = mock.Mock(**{"get_wch.side_effect": keys}), mock.Mock()
+            with self.subTest(keys=keys), mock.patch.object(todoit.curses, "keyname", return_value=b""):
+                self.assertEqual(todoit.pick(scr, panel, "ws?", ["abf", "afb"], search=True), want)
+            self.assertEqual(panel.call_args.args[0][0], header)
+            if "b" in keys and left in keys:
+                self.assertIn("ws? a_f", [c.args[0][0] for c in panel.call_args_list])
+
     def test_prompt_keep_on_back(self):
         scr = mock.Mock(**{"getmaxyx.return_value": (24, 80)})
-        scr.get_wch.side_effect = ["a", "b", todoit.curses.KEY_LEFT]
+        scr.get_wch.side_effect = ["a", "b"] + [todoit.curses.KEY_LEFT] * 3
         keep = [""]
         with mock.patch.object(todoit.curses, "curs_set"), mock.patch.object(todoit, "C", return_value=0):
             self.assertIs(todoit.prompt(scr, "x: ", "", keep=keep, nav=True), todoit.BACK)
@@ -532,7 +655,7 @@ class Spawn(unittest.TestCase):
             scr.get_wch.side_effect = [todoit.curses.KEY_RIGHT]
             self.assertEqual(todoit.prompt(scr, "x: ", " ab ", nav=True), "ab")
             scr.get_wch.side_effect = ["a", todoit.curses.KEY_LEFT, "b", todoit.curses.KEY_RIGHT, "c", "\n"]
-            self.assertEqual(todoit.prompt(scr, "x: ", keep=keep), "abc")
+            self.assertEqual(todoit.prompt(scr, "x: ", keep=keep), "bac")
             self.assertEqual(keep, ["ab"])
             scr.get_wch.side_effect = [todoit.curses.KEY_LEFT]
             self.assertIs(todoit.prompt(scr, "x: ", nav=True), todoit.BACK)
