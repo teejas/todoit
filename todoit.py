@@ -29,6 +29,7 @@ DRAFTER = ["claude", "-p", "--model", "claude-sonnet-5-5", "--tools", "", "--no-
 HEADS_UP = timedelta(minutes=30)
 DEFAULT_TIME = "17:00"
 DOUBLE_ESC = 0.5  # seconds between Esc taps
+BACK = object()  # pick/prompt result for ←: previous spawn step
 KINDS = ("daily", "weekly", "todo")
 DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 LINK = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
@@ -36,8 +37,7 @@ URL = re.compile(r"https?://[^\s)]+")
 HINT = {"daily": "due HH:MM", "weekly": "due DAY [HH:MM]", "todo": "due today|tomorrow|+N|fri|MM-DD|YYYY-MM-DD [HH:MM]"}
 HELP = "space done a/r/w add todo/daily/weekly  e edit  d del  o link  c agent  q quit"
 MODELS = {"claude": ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5"],
-          "codex": ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-sol"],
-          "opencode": ["opencode/claude-opus-5-5", "opencode/gemini-3.1-pro", "opencode/glm-5.3"]}
+          "codex": ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-sol"]}
 CHEERS = ("nice.", "crushed it.", "one down.", "boom.", "look at you go.", "chef's kiss.", "shipped.", "unstoppable.")
 G, DRAG = 0.05, 0.92  # particle gravity (rows/frame^2) and air drag; tune to taste
 RED, YELLOW, GREEN, CYAN, MAGENTA, BLUE = range(1, 7)
@@ -206,9 +206,21 @@ def draft(title, cwd):
     return (text, None) if text else (None, "empty draft")
 
 
-def herdr(*args):
+def tilde(path):
+    # ponytail: macOS homes only (`/Users/<user>`); Path.home() is wrong for paths on a remote machine
+    return re.sub(r"^/Users/[^/]+", "~", path)
+
+
+def herdr(*args, machine=None, timeout=90):
+    """herdr CLI locally or, given a `herdr machine list --json` entry, on that machine over ssh
+    (machines are client-side SSH profiles; each runs its own herdr server)."""
+    cmd = ["herdr", *args]
+    if machine:
+        # ponytail: ConnectTimeout=3, sequential, no threads: an asleep machine costs ~3s before the picker opens; remote listings capped at 10s
+        cmd = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", machine["target"],  # -n: never read the TUI's stdin (would eat keystrokes)
+               shlex.join(["herdr", "--session", machine["session"], *args])]
     try:
-        r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=90, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except OSError as e:
         raise RuntimeError(f"herdr failed to start: {e}")
     except subprocess.TimeoutExpired:
@@ -220,7 +232,26 @@ def herdr(*args):
             detail = r.stderr.strip().splitlines()
             msg = detail[-1] if detail else f"herdr exited {r.returncode}"
         raise RuntimeError(msg)
-    return (json.loads(r.stdout).get("result") or {}) if r.stdout.strip() else {}
+    out = json.loads(r.stdout) if r.stdout.strip() else {}
+    return (out.get("result") or {}) if isinstance(out, dict) else out  # `machine list --json` is a bare array, not the API envelope
+
+
+def remote_workspaces():
+    """(machine, workspace) for every workspace on every enabled saved machine. A machine that can't be
+    listed (asleep, offline, no key, bad JSON) is logged and skipped so the rest still show."""
+    rows = []
+    try:
+        machines = [m for m in herdr("machine", "list", "--json") if m["enabled"]]
+    except (RuntimeError, ValueError, KeyError, TypeError) as e:
+        log.error("herdr machine list: %s", e)   # e.g. an older herdr without `machine`: local-only, not fatal
+        return rows
+    log.info("machines: %s", [m["label"] for m in machines])
+    for mc in machines:
+        try:
+            rows += [(mc, w) for w in herdr("workspace", "list", machine=mc, timeout=10)["workspaces"]]
+        except (RuntimeError, ValueError, KeyError, TypeError) as e:
+            log.error("%s (%s) skipped: %s", mc["label"], mc["target"], e)
+    return rows
 
 
 # ---------- TUI ----------
@@ -367,8 +398,9 @@ def edit(scr, ch, text, last_esc):
     return text, None
 
 
-def prompt(scr, label_, text=""):
-    """One-line editor. Enter returns text, Esc clears, Esc Esc cancels, Option+Backspace deletes a word."""
+def prompt(scr, label_, text="", keep=None, nav=False):
+    """One-line editor. Enter returns stripped text, Esc clears, Esc Esc cancels, Option+Backspace deletes a word.
+    With nav, → submits and ← returns BACK, storing the current text in `keep` (a list) if given."""
     curses.curs_set(1)
     scr.timeout(-1)
     last_esc = None
@@ -384,8 +416,12 @@ def prompt(scr, label_, text=""):
             put(scr, h - 1, x, shown)
             scr.move(h - 1, min(x + len(shown), w - 1))
             ch = scr.get_wch()
-            if ch in ("\n", "\r", curses.KEY_ENTER):
+            if ch in ("\n", "\r", curses.KEY_ENTER) or (nav and ch == curses.KEY_RIGHT):
                 return text.strip()
+            if nav and ch == curses.KEY_LEFT:
+                if keep is not None:
+                    keep[:] = [text]
+                return BACK
             text, last_esc = edit(scr, ch, text, last_esc)
             if text is None:
                 return None
@@ -520,11 +556,12 @@ def draw_panel(scr, s, cur, title, lines, focus=0):
     scr.refresh()
 
 
-def pick(scr, panel, question, items, search=False):
-    """Menu in the panel. Digits or j/k + Enter pick. With search=True typed text filters instead (every
-    space-separated term a case-insensitive substring), arrows move, Esc clears, Esc Esc cancels and
-    Option+Backspace deletes a word. Without search, Esc returns None."""
-    c, q, last_esc = 0, "", None
+def pick(scr, panel, question, items, search=False, default=None):
+    """Menu starting on `default` (an index into items). Enter/→ picks, ← returns BACK, ↑/↓ move.
+    Without search, digits pick and j/k move; Esc does nothing. With search, typed text filters (every
+    space-separated term a case-insensitive substring), Esc clears and Option+Backspace deletes a word.
+    Esc Esc cancels in both modes."""
+    c, q, last_esc = default or 0, "", None
     scr.timeout(-1)
     try:
         while True:
@@ -535,18 +572,18 @@ def pick(scr, panel, question, items, search=False):
             ch = scr.get_wch()
             if ch != "\x1b":
                 last_esc = None
-            if not search and ch == "\x1b":
-                return None
-            if ch in ("\n", "\r", curses.KEY_ENTER):
+            if ch in ("\n", "\r", curses.KEY_ENTER, curses.KEY_RIGHT):
                 if hits:
                     return hits[c]
+            elif ch == curses.KEY_LEFT:
+                return BACK
             elif ch == curses.KEY_DOWN or (not search and ch == "j"):
                 c += 1
             elif ch == curses.KEY_UP or (not search and ch == "k"):
                 c -= 1
             elif not search and isinstance(ch, str) and ch in "123456789" and int(ch) <= len(hits):
                 return hits[int(ch) - 1]
-            elif search:
+            elif search or ch == "\x1b":
                 q, last_esc = edit(scr, ch, q, last_esc)
                 if q is None:
                     return None
@@ -563,71 +600,81 @@ def spawn(scr, s, cur, task):
     def panel(lines, focus=0):
         draw_panel(scr, s, cur, title, lines, focus)
     try:
-        spaces = herdr("workspace", "list")["workspaces"]
+        rows = [(None, w) for w in herdr("workspace", "list")["workspaces"]]
     except (RuntimeError, ValueError, KeyError) as e:
         log.error("herdr workspace list: %s", e)
         return f"✗ {e}"
-    home = str(Path.home())
-    items = [w["label"] + (f'  {w["worktree"]["checkout_path"].replace(home, "~", 1)}' if w.get("worktree") else "") for w in spaces]
-    i = pick(scr, panel, "workspace?", items, search=True)
-    if i is None:
-        return None
-    ws = spaces[i]
-    wt = ws.get("worktree") or {}
-    checkout = wt.get("checkout_path")
-    # herdr only creates worktrees from the repo's main checkout workspace.
-    how = (pick(scr, panel, "how?", ["new tab in it", "new worktree off it"])
-           if checkout and not wt.get("is_linked_worktree") else 0)
-    if how is None:
-        return None
-    if how == 1:
-        branch = prompt(scr, "branch: ", slug(task["title"]))
-        if not branch:
+    rows += remote_workspaces()
+    items = [(f'{mc["label"]} · ' if mc else "") + w["label"]
+             + (f'  {tilde(w["worktree"]["checkout_path"])}' if w.get("worktree") else "") for mc, w in rows]
+    # Steps: workspace, how?, branch:, harness?, model?, model:, prompt. ← goes back (first step stays); Enter/→ advance.
+    # Esc clears, Esc Esc exits; blank stays unless accepting a draft. Conditional steps skip both ways; answers kept; drafts cached per cwd.
+    a, k, d, drafts, typed = [None] * 6, 0, 1, {}, [""]
+    while True:
+        mc, ws = rows[a[0]] if a[0] is not None else (None, {})
+        wt = ws.get("worktree") or {}
+        checkout = wt.get("checkout_path")
+        main = bool(checkout and not wt.get("is_linked_worktree"))  # herdr only creates worktrees from the repo's main checkout
+        how = a[1] if main else 0
+        harness = list(MODELS)[a[3]] if a[3] is not None else None
+        if (k == 1 and not main) or (k == 2 and how != 1) or (k == 5 and a[4] != len(MODELS[harness])):
+            k += d
+            continue
+        if k == 0:
+            r = pick(scr, panel, "workspace?", items, search=True, default=a[0])
+        elif k == 1:
+            r = pick(scr, panel, "how?", ["new tab in it", "new worktree off it"], default=a[1])
+        elif k == 2:
+            r = prompt(scr, "branch: ", a[2] or slug(task["title"]), nav=True)
+        elif k == 3:
+            r = pick(scr, panel, "harness?", list(MODELS), default=a[3])
+        elif k == 4:
+            r = pick(scr, panel, "model?", MODELS[harness] + ["other…"], default=a[4])
+        elif k == 5:
+            r = prompt(scr, "model: ", a[5] or "", nav=True)
+        else:
+            cwd = str(Path(checkout).parent / a[2]) if how == 1 else checkout or ws["label"]  # worktree: sibling of the checkout; tab: draft context only
+            if cwd not in drafts or drafts[cwd][1]:
+                panel(["drafting prompt…"])
+                drafts[cwd] = draft(task["title"], cwd)
+                curses.flushinp()
+                if drafts[cwd][1]:
+                    log.error("draft: %s", drafts[cwd][1])
+            text, error = drafts[cwd]
+            panel(textwrap.wrap(text, max(1, scr.getmaxyx()[1] - 2)) if text else [f"✗ {error}"])
+            r = prompt(scr, "prompt (enter = suggested): " if text and not typed[0] else "prompt: ", typed[0], keep=typed, nav=True)
+            if r is not None and r is not BACK and (r or text):
+                p = r or text
+                break
+        if r is None:                     # Esc Esc: back to the todo list
             return None
-        cwd = str(Path(checkout).parent / branch)          # sibling of the checkout
-    else:
-        cwd = checkout or ws["label"]                      # draft context only; herdr picks a non-git tab's dir
-    h = pick(scr, panel, "harness?", list(MODELS))
-    if h is None:
-        return None
-    harness = list(MODELS)[h]
-    m = pick(scr, panel, "model?", MODELS[harness] + ["other…"])
-    if m is None:
-        return None
-    model = MODELS[harness][m] if m < len(MODELS[harness]) else prompt(scr, "model: ")
-    if not model:
-        return None
-    panel(["drafting prompt…"])
-    text, error = draft(task["title"], cwd)
-    curses.flushinp()
-    if error:
-        log.error("draft: %s", error)
-    panel(textwrap.wrap(text, max(1, scr.getmaxyx()[1] - 2)) if text else [f"✗ {error}"])
-    typed = prompt(scr, "prompt (enter = suggested): " if text else "prompt: ")
-    if typed is None or not (typed or text):
-        return None
-    p = typed or text
-    # `--` / `--prompt=` so a prompt starting with `-` is never parsed as a flag
-    argv = [harness, "--model", model] + ([f"--prompt={p}"] if harness == "opencode" else ["--", p])
-    panel([f"spawning {harness} · {model} · {cwd}…"])
+        if r is BACK:                     # ←: previous step; the first step stays put
+            k, d = max(0, k - 1), -1
+        elif r != "":                     # a blank answer stays on the step
+            a[k], d = r, 1
+            k += 1
+    model = MODELS[harness][a[4]] if a[4] < len(MODELS[harness]) else a[5]
+    argv = [harness, "--model", model, "--", p]  # `--` so a prompt starting with `-` is never parsed as a flag
+    where = f'{mc["label"]} · ' if mc else ""
+    panel([f"spawning {harness} · {model} · {where}{cwd}…"])
     # ponytail: blocking; worktree create freezes the clock a few seconds. thread it if that bites
-    # ponytail: prompt rides the shell command line; if >1KB prompts get eaten during shell startup,
-    # switch to agent start + agent prompt
+    # ponytail: prompt rides the shell command line (quoted twice over ssh); if >1KB prompts get eaten during
+    # shell startup, switch to agent start + agent prompt
     try:
         if how == 1:
-            r = herdr("worktree", "create", "--workspace", ws["workspace_id"], "--branch", branch,
-                      "--path", cwd, "--label", branch, "--no-focus")
+            r = herdr("worktree", "create", "--workspace", ws["workspace_id"], "--branch", a[2],
+                      "--path", cwd, "--label", a[2], "--no-focus", machine=mc)
         else:
             r = herdr("tab", "create", "--workspace", ws["workspace_id"], *(["--cwd", checkout] if checkout else []),
-                      "--label", title, "--no-focus")
-        herdr("pane", "run", r["root_pane"]["pane_id"], shlex.join(argv))
+                      "--label", title, "--no-focus", machine=mc)
+        herdr("pane", "run", r["root_pane"]["pane_id"], shlex.join(argv), machine=mc)
     except (RuntimeError, ValueError, KeyError) as e:
-        log.error("spawn in %s failed: %s", cwd, e)
+        log.error("spawn in %s%s failed: %s", where, cwd, e)
         return f"✗ {e}"
     finally:
         curses.flushinp()
-    log.info("spawned %s %s in %s: %s", harness, model, cwd, p)
-    return f"→ {harness} · {model} · " + (cwd.replace(home, "~", 1) if how == 1 else f'{ws["label"]} (new tab)')
+    log.info("spawned %s %s in %s%s: %s", harness, model, where, cwd, p)
+    return f"→ {harness} · {model} · {where}" + (tilde(cwd) if how == 1 else f'{ws["label"]} (new tab)')
 
 
 def tui(scr):

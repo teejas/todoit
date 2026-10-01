@@ -28,11 +28,9 @@ def state(**kw):
     return {"last_reset": "2026-09-28", "daily": [], "weekly": [], "todo": [], **kw}
 
 
-HOME = Path.home()
 TASK = task("Review [PR 41](https://x.io/pr/41)!", "2026-09-30 17:00")
-CHECKOUT = str(HOME / "vapi/repo/main")
-FEAT = str(HOME / "vapi/repo/feat")
-WT = str(HOME / "vapi/repo/review-pr-41")
+CHECKOUT, FEAT, WT = "/Users/t/vapi/repo/main", "/Users/t/vapi/repo/feat", "/Users/t/vapi/repo/review-pr-41"
+MINI_CHECKOUT, MINI_WT = "/Users/t.s/vapi/mono/main", "/Users/t.s/vapi/mono/review-pr-41"  # remote user's home differs
 
 
 def ok(result):
@@ -44,9 +42,23 @@ LIST = ok({"workspaces": [{"workspace_id": "wN", "label": "repo",
                           {"workspace_id": "wX", "label": "plain", "worktree": None},
                           {"workspace_id": "wL", "label": "feat",
                            "worktree": {"checkout_path": FEAT, "is_linked_worktree": True}}]})
+MINI = {"id": "1d99", "label": "mac-mini", "target": "t@mini", "session": "default", "enabled": True, "selected": False}
+MACHINES = subprocess.CompletedProcess([], 0, json.dumps([MINI, {**MINI, "id": "2", "label": "old", "target": "t@old", "enabled": False}]), "")  # bare array
+NO_MACHINES = subprocess.CompletedProcess([], 0, "[]\n", "")
+MINI_LIST = ok({"workspaces": [{"workspace_id": "w1H", "label": "arch-world", "worktree": {"checkout_path": MINI_CHECKOUT, "is_linked_worktree": False}},
+                               {"workspace_id": "w17", "label": "load tests", "worktree": {"checkout_path": "/Users/t.s/vapi/mono/tests", "is_linked_worktree": True}}]})
+DOWN = subprocess.CompletedProcess([], 255, "", "ssh: connect to host mini port 22: Operation timed out\n")
+GARBAGE = subprocess.CompletedProcess([], 0, "not json", "")
 CREATED = ok({"root_pane": {"pane_id": "w9:p1"}, "tab": {"tab_id": "w9:t1"}})
 RAN = subprocess.CompletedProcess([], 0, "", "")
-WS_LIST = [["herdr", "workspace", "list"]]
+WS_LIST = [["herdr", "workspace", "list"], ["herdr", "machine", "list", "--json"]]
+SSH = ["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "t@mini"]
+def remote(*args): return SSH + [shlex.join(["herdr", "--session", "default", *args])]
+LOCAL_ITEMS = ["repo  ~/vapi/repo/main", "plain", "feat  ~/vapi/repo/feat"]
+MINI_ITEMS = ["mac-mini · arch-world  ~/vapi/mono/main", "mac-mini · load tests  ~/vapi/mono/tests"]
+TAB_WN = ["herdr", "tab", "create", "--workspace", "wN", "--cwd", CHECKOUT, "--label", "Review PR 41!", "--no-focus"]
+TAB_WX = ["herdr", "tab", "create", "--workspace", "wX", "--label", "Review PR 41!", "--no-focus"]
+def run_line(harness, model, p="Fix it"): return ["herdr", "pane", "run", "w9:p1", shlex.join([harness, "--model", model, "--", p])]
 
 
 class ParseDue(unittest.TestCase):
@@ -399,24 +411,31 @@ class Spawn(unittest.TestCase):
         """Drive todoit.spawn with scripted picker/prompt/draft/herdr answers; returns (result, herdr argvs, mocks)."""
         with mock.patch.object(todoit, "pick", side_effect=picks) as pick, \
                 mock.patch.object(todoit, "prompt", side_effect=prompts) as prompt, \
-                mock.patch.object(todoit, "draft", return_value=drafted) as draft, \
+                mock.patch.object(todoit, "draft", **({"side_effect": drafted} if isinstance(drafted, list) else {"return_value": drafted})) as draft, \
                 mock.patch.object(todoit.subprocess, "run", side_effect=list(runs)) as run:
             result = todoit.spawn(self.scr, state(), 0, TASK)
-        return result, [c.args[0] for c in run.call_args_list], {"pick": pick, "prompt": prompt, "draft": draft}
+        return result, [c.args[0] for c in run.call_args_list], {"pick": pick, "prompt": prompt, "draft": draft, "run": run}
 
-    def test_slug(self):
+    def test_slug_and_tilde(self):
         self.assertEqual(todoit.slug("Review [PR 41](https://x.io/pr/41)!"), "review-pr-41")
         self.assertEqual(todoit.slug("!!!"), "task")
         s = todoit.slug("a" * 39 + "-" + "b" * 30)
         self.assertTrue(len(s) <= 40 and not s.endswith("-"))
+        self.assertEqual(todoit.tilde("/Users/t.s/vapi/x"), "~/vapi/x")
+        self.assertEqual(todoit.tilde("/opt/x"), "/opt/x")
 
     def test_pick_digit_mode(self):
         scr, panel = mock.Mock(), mock.Mock()
-        for n, (keys, want) in enumerate([(["j", "\n"], 1), (["2"], 1), (["k", "\r"], 0), (["\x1b"], None),
+        esc = ["\x1b", todoit.curses.error()]
+        for n, (keys, want) in enumerate([(["j", "\n"], 1), (["2"], 1), (["k", "\r"], 0), (esc + esc, None),
+                                           (esc + ["\n"], 0), ([todoit.curses.KEY_LEFT], todoit.BACK),
+                                           (["j", todoit.curses.KEY_RIGHT], 1), (esc + ["x"] + esc + ["\n"], 0),
+                                           (esc + ["j"] + esc + ["\n"], 1),
                                            (["9", "\n"], 0), (["0", "\n"], 0),
                                            ([todoit.curses.KEY_DOWN, todoit.curses.KEY_ENTER], 1)]):
             scr.get_wch.side_effect = keys
-            self.assertEqual(todoit.pick(scr, panel, "q?", ["a", "b"]), want, keys)
+            with mock.patch.object(todoit.time, "monotonic", side_effect=[0, 0.1]):
+                self.assertEqual(todoit.pick(scr, panel, "q?", ["a", "b"]), want, keys)
             if n == 0:
                 self.assertEqual(panel.call_args.args, (["q?", "  1 a", "▸ 2 b"], 2))
         scr.timeout.assert_called_with(1000)
@@ -433,7 +452,10 @@ class Spawn(unittest.TestCase):
                                            (list("kaf zz") + ["\x1b", "\x7f", "\n"], 1),
                                            (list("kaf zz") + ["\x1b", "\b", "\n"], 1),
                                            (list("kaf zz") + ["\x1b", todoit.curses.KEY_BACKSPACE, "\n"], 1),
-                                           (list("kaf") + ["\x1b", "x", "\n"], 1)]):
+                                           (list("kaf") + ["\x1b", "x", "\n"], 1),
+                                           (list("kaf") + [todoit.curses.KEY_LEFT], todoit.BACK),
+                                           (list("kaf") + [todoit.curses.KEY_RIGHT], 1),
+                                           (["z", todoit.curses.KEY_RIGHT] + esc + ["\n"], 0)]):
             scr.get_wch.side_effect = keys
             scr.timeout.reset_mock()
             with mock.patch.object(todoit.time, "monotonic", side_effect=[0, 0.1]):
@@ -443,6 +465,74 @@ class Spawn(unittest.TestCase):
             if n == 0:
                 self.assertEqual(panel.call_args.args, (["ws? kaf_", "▸ kafka-ingest  ~/vapi/kafka/main"], 1))
 
+    def test_pick_default(self):
+        scr, panel = mock.Mock(), mock.Mock()
+        scr.get_wch.side_effect = ["\n"]
+        self.assertEqual(todoit.pick(scr, panel, "q?", ["a", "b"], default=1), 1)
+        self.assertEqual(panel.call_args.args, (["q?", "  1 a", "▸ 2 b"], 2))
+        scr.get_wch.side_effect = ["\n"]
+        self.assertEqual(todoit.pick(scr, panel, "ws?", ["a", "b", "c"], search=True, default=2), 2)
+        self.assertEqual(panel.call_args.args, (["ws? _", "  a", "  b", "▸ c"], 3))
+        scr.get_wch.side_effect = ["\n"]
+        self.assertEqual(todoit.pick(scr, panel, "q?", ["a", "b"], default=None), 0)
+
+    def test_prompt_keep_on_back(self):
+        scr = mock.Mock(**{"getmaxyx.return_value": (24, 80)})
+        scr.get_wch.side_effect = ["a", "b", todoit.curses.KEY_LEFT]
+        keep = [""]
+        with mock.patch.object(todoit.curses, "curs_set"), mock.patch.object(todoit, "C", return_value=0):
+            self.assertIs(todoit.prompt(scr, "x: ", "", keep=keep, nav=True), todoit.BACK)
+            self.assertEqual(keep, ["ab"])
+            scr.get_wch.side_effect = [todoit.curses.KEY_RIGHT]
+            self.assertEqual(todoit.prompt(scr, "x: ", " ab ", nav=True), "ab")
+            scr.get_wch.side_effect = ["a", todoit.curses.KEY_LEFT, "b", todoit.curses.KEY_RIGHT, "c", "\n"]
+            self.assertEqual(todoit.prompt(scr, "x: ", keep=keep), "abc")
+            self.assertEqual(keep, ["ab"])
+            scr.get_wch.side_effect = [todoit.curses.KEY_LEFT]
+            self.assertIs(todoit.prompt(scr, "x: ", nav=True), todoit.BACK)
+
+    def test_prompt_nav_esc_clears_and_cancels(self):
+        scr = mock.Mock(**{"getmaxyx.return_value": (24, 80)})
+        esc, keep = ["\x1b", todoit.curses.error()], ["saved"]
+        for keys, want in [(esc + [todoit.curses.KEY_RIGHT], ""), (esc + esc, None)]:
+            scr.get_wch.side_effect = keys
+            with mock.patch.object(todoit.curses, "curs_set"), mock.patch.object(todoit, "C", return_value=0), \
+                    mock.patch.object(todoit.time, "monotonic", side_effect=[0, 0.1]):
+                self.assertEqual(todoit.prompt(scr, "x: ", "old", keep=keep, nav=True), want)
+            self.assertEqual(keep, ["saved"])
+
+    def test_prompt_text_survives_back(self):
+        texts = []
+
+        def prompt(scr, label_, text="", keep=None, nav=False):
+            self.assertTrue(label_.startswith("prompt"))
+            self.assertTrue(nav)
+            texts.append(text)
+            if len(texts) == 1:
+                keep[0] = "mine"
+                return todoit.BACK
+            return text
+
+        _, argvs, m = self.spawn([0, 0, 0, 0, todoit.BACK, 1, 0], prompt, runs=[LIST, NO_MACHINES, CREATED, RAN])
+        self.assertEqual(texts[1], "mine")
+        self.assertEqual(argvs[3], run_line("codex", "gpt-6.1-sol", "mine"))
+        m["draft"].assert_called_once()
+
+    def test_prompt_label_after_typed_text(self):
+        labels = []
+
+        def prompt(scr, label_, text="", keep=None, nav=False):
+            self.assertTrue(nav)
+            labels.append(label_)
+            if len(labels) == 1:
+                keep[0] = "mine"
+                return todoit.BACK
+            return text
+
+        _, argvs, _ = self.spawn([0, 0, 0, 0, 0], prompt, runs=[LIST, NO_MACHINES, CREATED, RAN])
+        self.assertEqual(labels[1], "prompt: ")
+        self.assertEqual(argvs[3], run_line("claude", "claude-opus-5-5", "mine"))
+
     def test_needs_herdr(self):
         with mock.patch.dict(os.environ, {"HERDR_ENV": "0"}), \
                 mock.patch.object(todoit.subprocess, "run") as run, mock.patch.object(todoit, "pick") as pick:
@@ -451,42 +541,37 @@ class Spawn(unittest.TestCase):
         pick.assert_not_called()
 
     def test_worktree_launch_per_harness(self):
+        self.assertEqual(list(todoit.MODELS), ["claude", "codex"])
         for h, harness in enumerate(todoit.MODELS):
             with self.subTest(harness=harness):
-                result, argvs, m = self.spawn([0, 1, h, 0], ["review-pr-41", ""], runs=[LIST, CREATED, RAN])
+                result, argvs, m = self.spawn([0, 1, h, 0], ["review-pr-41", ""], runs=[LIST, NO_MACHINES, CREATED, RAN])
                 model = todoit.MODELS[harness][0]
-                tail = ["--prompt=Fix it"] if harness == "opencode" else ["--", "Fix it"]
                 self.assertEqual(argvs, WS_LIST + [
                     ["herdr", "worktree", "create", "--workspace", "wN", "--branch", "review-pr-41",
                      "--path", WT, "--label", "review-pr-41", "--no-focus"],
-                    ["herdr", "pane", "run", "w9:p1", shlex.join([harness, "--model", model, *tail])]])
+                    run_line(harness, model)])
                 self.assertEqual(result, f"→ {harness} · {model} · ~/vapi/repo/review-pr-41")
                 self.assertEqual(m["prompt"].call_args_list[0].args[1:], ("branch: ", "review-pr-41"))
                 m["draft"].assert_called_once_with(TASK["title"], WT)
 
     def test_tab_in_git_workspace(self):
-        result, argvs, m = self.spawn([0, 0, 1, 0], [""], runs=[LIST, CREATED, RAN])
-        self.assertEqual(argvs, WS_LIST + [
-            ["herdr", "tab", "create", "--workspace", "wN", "--cwd", CHECKOUT, "--label", "Review PR 41!", "--no-focus"],
-            ["herdr", "pane", "run", "w9:p1", shlex.join(["codex", "--model", "gpt-6.1-sol", "--", "Fix it"])]])
+        result, argvs, m = self.spawn([0, 0, 1, 0], [""], runs=[LIST, NO_MACHINES, CREATED, RAN])
+        self.assertEqual(argvs, WS_LIST + [TAB_WN, run_line("codex", "gpt-6.1-sol")])
         self.assertEqual(result, "→ codex · gpt-6.1-sol · repo (new tab)")
         m["draft"].assert_called_once_with(TASK["title"], CHECKOUT)
-        self.assertEqual(m["pick"].call_args_list[0].args[2:],
-                         ("workspace?", ["repo  ~/vapi/repo/main", "plain", "feat  ~/vapi/repo/feat"]))
-        self.assertEqual(m["pick"].call_args_list[0].kwargs, {"search": True})
+        self.assertEqual(m["pick"].call_args_list[0].args[2:], ("workspace?", LOCAL_ITEMS))
+        self.assertEqual(m["pick"].call_args_list[0].kwargs, {"search": True, "default": None})
         self.assertEqual(m["pick"].call_args_list[1].args[2:], ("how?", ["new tab in it", "new worktree off it"]))
 
     def test_tab_in_non_git_workspace_skips_how(self):
-        result, argvs, m = self.spawn([1, 2, 0], [""], runs=[LIST, CREATED, RAN])
-        self.assertEqual(argvs, WS_LIST + [
-            ["herdr", "tab", "create", "--workspace", "wX", "--label", "Review PR 41!", "--no-focus"],
-            ["herdr", "pane", "run", "w9:p1", shlex.join(["opencode", "--model", "opencode/claude-opus-5-5", "--prompt=Fix it"])]])
-        self.assertEqual(result, "→ opencode · opencode/claude-opus-5-5 · plain (new tab)")
+        result, argvs, m = self.spawn([1, 1, 0], [""], runs=[LIST, NO_MACHINES, CREATED, RAN])
+        self.assertEqual(argvs, WS_LIST + [TAB_WX, run_line("codex", "gpt-6.1-sol")])
+        self.assertEqual(result, "→ codex · gpt-6.1-sol · plain (new tab)")
         self.assertEqual([c.args[2] for c in m["pick"].call_args_list], ["workspace?", "harness?", "model?"])
         m["draft"].assert_called_once_with(TASK["title"], "plain")
 
     def test_tab_in_linked_worktree_skips_how(self):
-        result, argvs, m = self.spawn([2, 0, 0], [""], runs=[LIST, CREATED, RAN])
+        result, argvs, m = self.spawn([2, 0, 0], [""], runs=[LIST, NO_MACHINES, CREATED, RAN])
         self.assertEqual(argvs, WS_LIST + [
             ["herdr", "tab", "create", "--workspace", "wL", "--cwd", FEAT, "--label", "Review PR 41!", "--no-focus"],
             ["herdr", "pane", "run", "w9:p1", shlex.join(["claude", "--model", "claude-opus-5-5", "--", "Fix it"])]])
@@ -496,42 +581,162 @@ class Spawn(unittest.TestCase):
 
     def test_other_model_is_prompted(self):
         result, argvs, _ = self.spawn([0, 0, 1, 3], ["gpt-x", "it's $HOME"], drafted=("suggested", None),
-                                     runs=[LIST, CREATED, RAN])
-        self.assertEqual(argvs[2][4], shlex.join(["codex", "--model", "gpt-x", "--", "it's $HOME"]))
-        self.assertEqual(shlex.split(argvs[2][4]), ["codex", "--model", "gpt-x", "--", "it's $HOME"])
+                                     runs=[LIST, NO_MACHINES, CREATED, RAN])
+        self.assertEqual(argvs[3][4], shlex.join(["codex", "--model", "gpt-x", "--", "it's $HOME"]))
+        self.assertEqual(shlex.split(argvs[3][4]), ["codex", "--model", "gpt-x", "--", "it's $HOME"])
         self.assertEqual(result, "→ codex · gpt-x · repo (new tab)")
 
-    def test_cancel_creates_nothing(self):
+    def test_double_esc_at_any_step_cancels(self):
         for picks, prompts in [([None], []), ([0, None], []), ([0, 1], [None]), ([0, 0, None], []),
-                               ([0, 0, 0, None], []), ([0, 0, 0, 3], [None]), ([1, 0, 0], [None])]:
+                               ([0, 0, 0, None], []), ([0, 0, 0, 3], [None]), ([0, 0, 0, 0], [None])]:
             with self.subTest(picks=picks, prompts=prompts):
-                result, argvs, _ = self.spawn(picks, prompts, runs=[LIST])
+                result, argvs, m = self.spawn(picks, prompts, runs=[LIST, NO_MACHINES])
                 self.assertIsNone(result)
                 self.assertEqual(argvs, WS_LIST)
+                self.assertEqual(m["pick"].call_count, len(picks))
+                self.assertEqual(m["prompt"].call_count, len(prompts))
+                if picks == [0, 0, 0, 0]:
+                    m["draft"].assert_called_once()
+                else:
+                    m["draft"].assert_not_called()
+
+    def test_back_on_first_step_stays(self):
+        result, argvs, m = self.spawn([todoit.BACK, 0, todoit.BACK, todoit.BACK, None], [], runs=[LIST, NO_MACHINES])
+        self.assertIsNone(result)
+        self.assertEqual(argvs, WS_LIST)
+        self.assertEqual([c.args[2] for c in m["pick"].call_args_list],
+                         ["workspace?", "workspace?", "how?", "workspace?", "workspace?"])
+        self.assertEqual(m["pick"].call_args_list[-1].kwargs, {"search": True, "default": 0})
+        m["prompt"].assert_not_called()
+        m["draft"].assert_not_called()
+
+    def test_blank_branch_or_model_stays(self):
+        for picks, prompts, label, cwd in [([0, 1, 0, 0], ["", "review-pr-41", ""], "branch: ", WT),
+                                           ([0, 0, 1, 3], ["", "gpt-x", ""], "model: ", CHECKOUT)]:
+            with self.subTest(label=label):
+                result, argvs, m = self.spawn(picks, prompts, runs=[LIST, NO_MACHINES, CREATED, RAN])
+                self.assertIsNotNone(result)
+                self.assertEqual(len(argvs), 4)
+                self.assertEqual(m["pick"].call_count, len(picks))
+                self.assertEqual(m["prompt"].call_count, len(prompts))
+                calls = m["prompt"].call_args_list
+                self.assertEqual(calls[0], calls[1])
+                self.assertEqual(calls[0].args[1], label)
+                self.assertEqual(calls[0].kwargs, {"nav": True})
+                m["draft"].assert_called_once_with(TASK["title"], cwd)
 
     def test_draft_failure_requires_typed_prompt(self):
         with self.assertLogs("todoit", "ERROR"):
-            result, argvs, m = self.spawn([0, 0, 0, 0], [""], drafted=(None, "drafter timed out"), runs=[LIST])
+            result, argvs, m = self.spawn([0, 0, 0, 0], ["", None],
+                                         drafted=(None, "drafter timed out"), runs=[LIST, NO_MACHINES])
         self.assertIsNone(result)
         self.assertEqual(argvs, WS_LIST)
         self.assertIn(["✗ drafter timed out"], [c.args[4] for c in self.panel.call_args_list])
         self.assertEqual(m["prompt"].call_args.args[1], "prompt: ")
+        self.assertEqual(m["draft"].call_args_list, [mock.call(TASK["title"], CHECKOUT)] * 2)
+        self.assertEqual(m["pick"].call_count, 4)
+        self.assertEqual(m["prompt"].call_count, 2)
         with self.assertLogs("todoit", "ERROR"):
             result, argvs, _ = self.spawn([0, 0, 0, 0], ["typed it"], drafted=(None, "drafter timed out"),
-                                         runs=[LIST, CREATED, RAN])
-        self.assertEqual(argvs[2][4], shlex.join(["claude", "--model", "claude-opus-5-5", "--", "typed it"]))
+                                         runs=[LIST, NO_MACHINES, CREATED, RAN])
+        self.assertEqual(argvs[3][4], shlex.join(["claude", "--model", "claude-opus-5-5", "--", "typed it"]))
         self.assertEqual(result, "→ claude · claude-opus-5-5 · repo (new tab)")
+
+    def test_failed_draft_is_retried_after_back(self):
+        with self.assertLogs("todoit", "ERROR"):
+            result, _, m = self.spawn([0, 0, 0, 0, 0], [todoit.BACK, ""],
+                                     drafted=[(None, "boom"), ("Fix it", None)], runs=[LIST, NO_MACHINES, CREATED, RAN])
+        self.assertEqual(m["draft"].call_args_list, [mock.call(TASK["title"], CHECKOUT)] * 2)
+        self.assertEqual(result, "→ claude · claude-opus-5-5 · repo (new tab)")
+        self.assertEqual(m["prompt"].call_args_list[1].args[1], "prompt (enter = suggested): ")
+        self.assertEqual(m["pick"].call_args_list[-1].args[2], "model?")
 
     def test_herdr_error_is_shown(self):
         bad = subprocess.CompletedProcess([], 1, "", '{"error":{"code":"git_failed","message":"branch exists"},"id":"x"}\n')
         plain_err = subprocess.CompletedProcess([], 1, "", "first\nplain text\n")
-        for picks, prompts, runs, want in [([0, 1, 0, 0], ["b", ""], [LIST, bad], "✗ branch exists"),
-                                          ([0, 0, 0, 0], [""], [LIST, plain_err], "✗ plain text"),
-                                          ([], [], [bad], "✗ branch exists")]:
+        for picks, prompts, runs, want in [([0, 1, 0, 0], ["b", ""], [LIST, NO_MACHINES, bad], "✗ branch exists"),
+                                          ([0, 0, 0, 0], [""], [LIST, NO_MACHINES, plain_err], "✗ plain text"),
+                                          ([], [], [bad], "✗ branch exists"),
+                                          ([1, 1, 0], [""], [LIST, plain_err, CREATED, RAN], "→ codex · gpt-6.1-sol · plain (new tab)")]:
             with self.subTest(want=want), self.assertLogs("todoit", "ERROR"):
                 result, argvs, _ = self.spawn(picks, prompts, runs=runs)
                 self.assertEqual(result, want)
                 self.assertEqual(len(argvs), len(runs))
+
+    def test_remote_tab_lists_after_local_and_runs_over_ssh(self):
+        result, argvs, m = self.spawn([3, 0, 1, 0], [""], runs=[LIST, MACHINES, MINI_LIST, CREATED, RAN])
+        self.assertEqual(m["pick"].call_args_list[0].args[2:], ("workspace?", LOCAL_ITEMS + MINI_ITEMS))
+        self.assertEqual(m["pick"].call_args_list[1].args[2], "how?")
+        self.assertEqual(argvs, WS_LIST + [
+            remote("workspace", "list"),
+            remote("tab", "create", "--workspace", "w1H", "--cwd", MINI_CHECKOUT, "--label", "Review PR 41!", "--no-focus"),
+            remote("pane", "run", "w9:p1", shlex.join(["codex", "--model", "gpt-6.1-sol", "--", "Fix it"]))])
+        self.assertEqual(result, "→ codex · gpt-6.1-sol · mac-mini · arch-world (new tab)")
+        m["draft"].assert_called_once_with(TASK["title"], MINI_CHECKOUT)
+        self.assertEqual(m["run"].call_args_list[2].kwargs["timeout"], 10)
+        self.assertEqual(m["run"].call_args_list[3].kwargs["timeout"], 90)
+
+    def test_remote_worktree_is_sibling_of_remote_checkout(self):
+        result, argvs, m = self.spawn([3, 1, 0, 0], ["review-pr-41", ""], runs=[LIST, MACHINES, MINI_LIST, CREATED, RAN])
+        self.assertEqual(argvs[3:], [
+            remote("worktree", "create", "--workspace", "w1H", "--branch", "review-pr-41", "--path", MINI_WT,
+                   "--label", "review-pr-41", "--no-focus"),
+            remote("pane", "run", "w9:p1", shlex.join(["claude", "--model", "claude-opus-5-5", "--", "Fix it"]))])
+        self.assertEqual(result, "→ claude · claude-opus-5-5 · mac-mini · ~/vapi/mono/review-pr-41")
+        m["draft"].assert_called_once_with(TASK["title"], MINI_WT)
+
+    def test_ssh_quoting_round_trips(self):
+        _, argvs, _ = self.spawn([3, 0, 1, 3], ["gpt-x", "it's $HOME"], runs=[LIST, MACHINES, MINI_LIST, CREATED, RAN])
+        run = argvs[4]
+        self.assertEqual(run[:7], SSH)
+        self.assertEqual(len(run), 8)
+        outer = shlex.split(run[7])
+        self.assertEqual(outer, ["herdr", "--session", "default", "pane", "run", "w9:p1",
+                                 shlex.join(["codex", "--model", "gpt-x", "--", "it's $HOME"])])
+        self.assertEqual(shlex.split(outer[6]), ["codex", "--model", "gpt-x", "--", "it's $HOME"])
+
+    def test_unreachable_machine_is_skipped(self):
+        for bad in (DOWN, GARBAGE, subprocess.CompletedProcess([], 0, "null\n", "")):
+            with self.subTest(bad=bad):
+                with self.assertLogs("todoit", "ERROR") as logs:
+                    result, argvs, m = self.spawn([1, 1, 0], [""], runs=[LIST, MACHINES, bad, CREATED, RAN])
+                self.assertEqual(m["pick"].call_args_list[0].args[2:], ("workspace?", LOCAL_ITEMS))
+                self.assertTrue(logs.output[0].startswith("ERROR:todoit:mac-mini (t@mini) skipped: "))
+                if bad is DOWN:
+                    self.assertIn("Operation timed out", logs.output[0])
+                self.assertEqual(argvs, WS_LIST + [remote("workspace", "list"), TAB_WX, run_line("codex", "gpt-6.1-sol")])
+                self.assertEqual(result, "→ codex · gpt-6.1-sol · plain (new tab)")
+
+    def test_back_to_workspace_retargets(self):
+        result, argvs, m = self.spawn([0, 0, todoit.BACK, todoit.BACK, 1, 1, 0], [""], runs=[LIST, NO_MACHINES, CREATED, RAN])
+        self.assertEqual(argvs, WS_LIST + [TAB_WX, run_line("codex", "gpt-6.1-sol")])
+        self.assertEqual(result, "→ codex · gpt-6.1-sol · plain (new tab)")
+        self.assertEqual(m["pick"].call_args_list[3].args[2], "how?")
+        self.assertEqual(m["pick"].call_args_list[3].kwargs, {"default": 0})
+        self.assertEqual(m["pick"].call_args_list[4].kwargs, {"search": True, "default": 0})
+        m["draft"].assert_called_once_with(TASK["title"], "plain")
+
+    def test_back_hops_skipped_steps(self):
+        result, argvs, m = self.spawn([2, todoit.BACK, 0, 0, 0, 0], [""], runs=[LIST, NO_MACHINES, CREATED, RAN])
+        self.assertEqual([c.args[2] for c in m["pick"].call_args_list],
+                         ["workspace?", "harness?", "workspace?", "how?", "harness?", "model?"])
+        self.assertEqual(argvs, WS_LIST + [TAB_WN, run_line("claude", "claude-opus-5-5")])
+        self.assertEqual(result, "→ claude · claude-opus-5-5 · repo (new tab)")
+
+    def test_back_from_prompt_reuses_draft(self):
+        result, argvs, m = self.spawn([0, 0, 0, 0, todoit.BACK, 1, 0], [todoit.BACK, ""], runs=[LIST, NO_MACHINES, CREATED, RAN])
+        m["draft"].assert_called_once_with(TASK["title"], CHECKOUT)
+        self.assertEqual(argvs[3], run_line("codex", "gpt-6.1-sol"))
+        self.assertEqual(result, "→ codex · gpt-6.1-sol · repo (new tab)")
+        self.assertEqual(m["pick"].call_args_list[4].kwargs, {"default": 0})
+
+    def test_back_to_other_workspace_redrafts(self):
+        result, _, m = self.spawn([0, 1, 0, 0, todoit.BACK, todoit.BACK, todoit.BACK, 1, 0, 0], ["b", todoit.BACK, todoit.BACK, ""],
+                                 runs=[LIST, NO_MACHINES, CREATED, RAN])
+        self.assertEqual(m["draft"].call_args_list,
+                         [mock.call(TASK["title"], "/Users/t/vapi/repo/b"), mock.call(TASK["title"], "plain")])
+        self.assertEqual(m["prompt"].call_args_list[2].args[1:], ("branch: ", "b"))
+        self.assertEqual(result, "→ claude · claude-opus-5-5 · plain (new tab)")
 
     def test_draft_argv_and_errors(self):
         for res, want in [(subprocess.CompletedProcess([], 0, "  Do\nthe\0 thing ", ""), ("Do the thing", None)),
