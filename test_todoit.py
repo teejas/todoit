@@ -222,6 +222,35 @@ class AskTask(unittest.TestCase):
         self.assertIsNone(self.ask(["neon", None]))
 
 
+class Prompt(unittest.TestCase):
+    def edit(self, keys, text="", times=()):
+        scr = mock.Mock()
+        scr.getmaxyx.return_value = (5, 80)
+        scr.get_wch.side_effect = keys
+        with mock.patch.object(todoit, "C", return_value=0), \
+                mock.patch.object(todoit.curses, "curs_set"), \
+                mock.patch.object(todoit.time, "monotonic", side_effect=times):
+            return todoit.prompt(scr, "title: ", text), scr
+
+    def test_word_delete(self):
+        for backspace in ("\x7f", "\b", todoit.curses.KEY_BACKSPACE):
+            keys = list("buy oat-milk") + ["\x1b", backspace, "\x1b", backspace, "\x1b", "x",
+                                           "\x7f", todoit.curses.KEY_BACKSPACE, "\n"]
+            self.assertEqual(self.edit(keys)[0], "bu")
+
+    def test_esc_clears(self):
+        for text in ("old", ""):
+            keys = ["\x1b", todoit.curses.error()] + list("new") + ["\n"]
+            self.assertEqual(self.edit(keys, text, [0])[0], "new")
+
+    def test_double_esc(self):
+        esc = ["\x1b", todoit.curses.error()]
+        keys = esc + ["a"] + esc + esc + esc
+        result, scr = self.edit(keys, "old", [0, 0.1, 1, 1.1])
+        self.assertIsNone(result)
+        self.assertEqual(scr.get_wch.call_count, len(keys))
+
+
 class Display(unittest.TestCase):
     def setUp(self):
         patcher = mock.patch.object(todoit, "C", return_value=0)
@@ -395,11 +424,22 @@ class Spawn(unittest.TestCase):
     def test_pick_search_mode(self):
         scr, panel = mock.Mock(), mock.Mock()
         items = ["todoit  ~/personal/todoit/main", "kafka-ingest  ~/vapi/kafka/main", "scratch"]
+        esc = ["\x1b", todoit.curses.error()]
         for n, (keys, want) in enumerate([(["k", "a", "f", "\n"], 1), (["c", "h", " ", "s", "\n"], 2),
                                            (["z", "\n", "\x7f", todoit.curses.KEY_DOWN, todoit.curses.KEY_DOWN, "\n"], 2),
-                                           (["j", "2", "\n", "\x1b"], None), (["\x1b"], None)]):
+                                           (["j", "2", "\n"] + esc + esc, None), (esc + ["\n"], 0),
+                                           (list("zz") + esc + list("kaf") + ["\n"], 1),
+                                           (esc + [todoit.curses.KEY_DOWN] + esc + ["\n"], 1),
+                                           (list("kaf zz") + ["\x1b", "\x7f", "\n"], 1),
+                                           (list("kaf zz") + ["\x1b", "\b", "\n"], 1),
+                                           (list("kaf zz") + ["\x1b", todoit.curses.KEY_BACKSPACE, "\n"], 1),
+                                           (list("kaf") + ["\x1b", "x", "\n"], 1)]):
             scr.get_wch.side_effect = keys
-            self.assertEqual(todoit.pick(scr, panel, "ws?", items, search=True), want, keys)
+            scr.timeout.reset_mock()
+            with mock.patch.object(todoit.time, "monotonic", side_effect=[0, 0.1]):
+                self.assertEqual(todoit.pick(scr, panel, "ws?", items, search=True), want, keys)
+            self.assertEqual(scr.timeout.call_args_list,
+                             [mock.call(-1)] + [mock.call(0), mock.call(-1)] * keys.count("\x1b") + [mock.call(1000)])
             if n == 0:
                 self.assertEqual(panel.call_args.args, (["ws? kaf_", "▸ kafka-ingest  ~/vapi/kafka/main"], 1))
 

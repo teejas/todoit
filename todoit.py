@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -27,6 +28,7 @@ DRAFTER = ["claude", "-p", "--model", "claude-sonnet-5-5", "--tools", "", "--no-
            "--strict-mcp-config", "--setting-sources", ""]
 HEADS_UP = timedelta(minutes=30)
 DEFAULT_TIME = "17:00"
+DOUBLE_ESC = 0.5  # seconds between Esc taps
 KINDS = ("daily", "weekly", "todo")
 DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 LINK = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
@@ -341,10 +343,35 @@ def draw(scr, s, cur, t, status=None):
     return ys
 
 
+def edit(scr, ch, text, last_esc):
+    """One key of line editing for prompt/pick. Returns (text, last_esc); text None means Esc Esc (cancel)."""
+    if ch == "\x1b":
+        scr.timeout(0)
+        try:
+            ch = scr.get_wch()
+        except curses.error:
+            t = time.monotonic()
+            if last_esc is not None and t - last_esc <= DOUBLE_ESC:
+                return None, None
+            return "", t
+        else:
+            if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                text = re.sub(r"\w*\W*$", "", text)
+            return text, None
+        finally:
+            scr.timeout(-1)
+    if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+        text = text[:-1]
+    elif isinstance(ch, str) and ch.isprintable():
+        text += ch
+    return text, None
+
+
 def prompt(scr, label_, text=""):
-    """One-line editor on the bottom row. Enter returns the text, Esc returns None."""
+    """One-line editor. Enter returns text, Esc clears, Esc Esc cancels, Option+Backspace deletes a word."""
     curses.curs_set(1)
     scr.timeout(-1)
+    last_esc = None
     try:
         while True:
             h, w = scr.getmaxyx()
@@ -359,12 +386,9 @@ def prompt(scr, label_, text=""):
             ch = scr.get_wch()
             if ch in ("\n", "\r", curses.KEY_ENTER):
                 return text.strip()
-            if ch == "\x1b":
+            text, last_esc = edit(scr, ch, text, last_esc)
+            if text is None:
                 return None
-            if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
-                text = text[:-1]
-            elif isinstance(ch, str) and ch.isprintable():
-                text += ch
     finally:
         curses.curs_set(0)
         scr.timeout(1000)
@@ -498,8 +522,9 @@ def draw_panel(scr, s, cur, title, lines, focus=0):
 
 def pick(scr, panel, question, items, search=False):
     """Menu in the panel. Digits or j/k + Enter pick. With search=True typed text filters instead (every
-    space-separated term a case-insensitive substring) and only the arrow keys move. Esc returns None."""
-    c, q = 0, ""
+    space-separated term a case-insensitive substring), arrows move, Esc clears, Esc Esc cancels and
+    Option+Backspace deletes a word. Without search, Esc returns None."""
+    c, q, last_esc = 0, "", None
     scr.timeout(-1)
     try:
         while True:
@@ -508,7 +533,9 @@ def pick(scr, panel, question, items, search=False):
             panel([question + (f" {q}_" if search else "")]
                   + [f"{'▸' if n == c else ' '} " + ("" if search else f"{n + 1} ") + items[i] for n, i in enumerate(hits)], c + 1)
             ch = scr.get_wch()
-            if ch == "\x1b":
+            if ch != "\x1b":
+                last_esc = None
+            if not search and ch == "\x1b":
                 return None
             if ch in ("\n", "\r", curses.KEY_ENTER):
                 if hits:
@@ -519,10 +546,10 @@ def pick(scr, panel, question, items, search=False):
                 c -= 1
             elif not search and isinstance(ch, str) and ch in "123456789" and int(ch) <= len(hits):
                 return hits[int(ch) - 1]
-            elif search and ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
-                q = q[:-1]
-            elif search and isinstance(ch, str) and ch.isprintable():
-                q += ch
+            elif search:
+                q, last_esc = edit(scr, ch, q, last_esc)
+                if q is None:
+                    return None
     finally:
         scr.timeout(1000)
 
