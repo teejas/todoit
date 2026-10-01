@@ -398,8 +398,9 @@ def edit(scr, ch, text, last_esc):
     return text, None
 
 
-def prompt(scr, label_, text="", keep=None, nav=False):
+def prompt(scr, label_, text="", keep=None, nav=False, esc_empty=False):
     """One-line editor. Enter returns stripped text, Esc clears, Esc Esc cancels, Option+Backspace deletes a word.
+    With esc_empty, Esc on an already-empty field returns None at once.
     With nav, → submits and ← returns BACK, storing the current text in `keep` (a list) if given."""
     curses.curs_set(1)
     scr.timeout(-1)
@@ -422,8 +423,9 @@ def prompt(scr, label_, text="", keep=None, nav=False):
                 if keep is not None:
                     keep[:] = [text]
                 return BACK
+            was = text
             text, last_esc = edit(scr, ch, text, last_esc)
-            if text is None:
+            if text is None or (esc_empty and last_esc is not None and not was):
                 return None
     finally:
         curses.curs_set(0)
@@ -443,24 +445,28 @@ def confirm(scr, msg):
 
 
 def ask_task(scr, kind, task=None):
-    """Prompt for (title, due); re-asks until the due parses and a new todo due is in the future. None if cancelled."""
-    title = prompt(scr, "title: ", task["title"] if task else "")
-    if not title:
-        return None
-    hint, raw = HINT[kind], task["due"] if task else ""
+    """Prompt for (title, due); re-asks until the due parses and a new todo due is in the future.
+    Esc on an empty title cancels; on an empty due goes back to the title. None if cancelled."""
+    title, raw = (task["title"], task["due"]) if task else ("", "")
     while True:
-        raw = prompt(scr, f"{hint}: ", raw)
-        if raw is None:
+        title = prompt(scr, "title: ", title, esc_empty=True)
+        if not title:
             return None
-        try:
-            due = parse_due(kind, raw, now().date())
-        except (ValueError, OverflowError):
-            hint = "✗ invalid · " + HINT[kind]
-            continue
-        if kind == "todo" and due != (task and task["due"]) and due_at(kind, {"due": due}, now().date()) <= now():
-            hint = "✗ that's in the past · " + HINT[kind]
-            continue
-        return title, due
+        hint = HINT[kind]
+        while True:
+            raw = prompt(scr, f"{hint}: ", raw, esc_empty=True)
+            if raw is None:
+                raw = ""
+                break
+            try:
+                due = parse_due(kind, raw, now().date())
+            except (ValueError, OverflowError):
+                hint = "✗ invalid · " + HINT[kind]
+                continue
+            if kind == "todo" and due != (task and task["due"]) and due_at(kind, {"due": due}, now().date()) <= now():
+                hint = "✗ that's in the past · " + HINT[kind]
+                continue
+            return title, due
 
 
 def burst(x, y, n, speed, up=0.0, color=None):

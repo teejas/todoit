@@ -231,18 +231,32 @@ class AskTask(unittest.TestCase):
 
     def test_cancel(self):
         self.assertIsNone(self.ask([""]))
-        self.assertIsNone(self.ask(["neon", None]))
+        self.assertIsNone(self.ask([None]))
+        self.assertIsNone(self.ask(["neon", None, None]))
+
+    def test_due_esc_goes_back_to_title(self):
+        with mock.patch.object(todoit, "prompt", side_effect=["neon", "someday", None, "neon 2", "tomorrow"]) as prompt, \
+                mock.patch.object(todoit, "now", return_value=at(28, 19, 0)):
+            self.assertEqual(todoit.ask_task(None, "todo"), ("neon 2", "2026-09-29 17:00"))
+        hint = todoit.HINT["todo"]
+        self.assertEqual(prompt.call_args_list, [
+            mock.call(None, "title: ", "", esc_empty=True),
+            mock.call(None, f"{hint}: ", "", esc_empty=True),
+            mock.call(None, f"✗ invalid · {hint}: ", "someday", esc_empty=True),
+            mock.call(None, "title: ", "neon", esc_empty=True),
+            mock.call(None, f"{hint}: ", "", esc_empty=True),
+        ])
 
 
 class Prompt(unittest.TestCase):
-    def edit(self, keys, text="", times=()):
+    def edit(self, keys, text="", times=(), **kw):
         scr = mock.Mock()
         scr.getmaxyx.return_value = (5, 80)
         scr.get_wch.side_effect = keys
         with mock.patch.object(todoit, "C", return_value=0), \
                 mock.patch.object(todoit.curses, "curs_set"), \
                 mock.patch.object(todoit.time, "monotonic", side_effect=times):
-            return todoit.prompt(scr, "title: ", text), scr
+            return todoit.prompt(scr, "title: ", text, **kw), scr
 
     def test_word_delete(self):
         for backspace in ("\x7f", "\b", todoit.curses.KEY_BACKSPACE):
@@ -254,6 +268,17 @@ class Prompt(unittest.TestCase):
         for text in ("old", ""):
             keys = ["\x1b", todoit.curses.error()] + list("new") + ["\n"]
             self.assertEqual(self.edit(keys, text, [0])[0], "new")
+
+    def test_esc_empty(self):
+        esc = ["\x1b", todoit.curses.error()]
+        keys = ["a"] + esc + esc
+        result, scr = self.edit(keys, times=[0, 5], esc_empty=True)
+        self.assertIsNone(result)
+        self.assertEqual(scr.get_wch.call_count, len(keys))
+        self.assertEqual(self.edit(keys + ["x", "\n"], times=[0, 5])[0], "x")
+
+    def test_word_delete_empty(self):
+        self.assertEqual(self.edit(["\x1b", "\x7f", "x", "\n"], esc_empty=True)[0], "x")
 
     def test_double_esc(self):
         esc = ["\x1b", todoit.curses.error()]
