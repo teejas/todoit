@@ -12,6 +12,7 @@ import math
 import os
 import random
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -21,10 +22,9 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 DB = Path(os.environ.get("TODOIT_HOME", Path.home() / ".todoit")) / "tasks.json"
-CONFIG = DB.parent / "config.json"
 # skip user settings (plugins, hooks) and MCP servers: inheriting them is ~230K+ input tokens and ~9s per turn vs ~3.5s
-DEFAULT_AGENT = ["claude", "-p", "--model", "claude-sonnet-5-5", "--tools", "", "--no-session-persistence",
-                 "--strict-mcp-config", "--setting-sources", ""]
+DRAFTER = ["claude", "-p", "--model", "claude-sonnet-5-5", "--tools", "", "--no-session-persistence",
+           "--strict-mcp-config", "--setting-sources", ""]
 HEADS_UP = timedelta(minutes=30)
 DEFAULT_TIME = "17:00"
 KINDS = ("daily", "weekly", "todo")
@@ -32,7 +32,10 @@ DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sun
 LINK = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
 URL = re.compile(r"https?://[^\s)]+")
 HINT = {"daily": "due HH:MM", "weekly": "due DAY [HH:MM]", "todo": "due today|tomorrow|+N|fri|MM-DD|YYYY-MM-DD [HH:MM]"}
-HELP = "space done a/r/w add todo/daily/weekly  e edit  d del  o link  c chat  q quit"
+HELP = "space done a/r/w add todo/daily/weekly  e edit  d del  o link  c agent  q quit"
+MODELS = {"claude": ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5"],
+          "codex": ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-sol"],
+          "opencode": ["opencode/claude-opus-5-5", "opencode/gemini-3.1-pro", "opencode/glm-5.3"]}
 CHEERS = ("nice.", "crushed it.", "one down.", "boom.", "look at you go.", "chef's kiss.", "shipped.", "unstoppable.")
 G, DRAG = 0.05, 0.92  # particle gravity (rows/frame^2) and air drag; tune to taste
 RED, YELLOW, GREEN, CYAN, MAGENTA, BLUE = range(1, 7)
@@ -178,164 +181,44 @@ def save(s):
     os.replace(tmp, DB)  # atomic swap: a crash mid-write can't truncate tasks.json
 
 
-# ---------- agent ----------
+# ---------- spawn ----------
 
-def agent_argv():
+def slug(title):
+    return re.sub(r"[^a-z0-9]+", "-", plain(title).lower())[:40].strip("-") or "task"
+
+
+def draft(title, cwd):
+    ask = (f"Write the prompt a coding agent will receive to work on this todo in {cwd}: {title}\n"
+           "One paragraph, under 80 words, concrete, no preamble, no quotes; include any URL from the todo. "
+           "Output only the prompt.")
     try:
-        config = json.loads(CONFIG.read_text())
-    except FileNotFoundError:
-        return DEFAULT_AGENT
-    argv = config.get("agent", DEFAULT_AGENT) if isinstance(config, dict) else None
-    if not isinstance(argv, list) or not argv or any(not isinstance(x, str) for x in argv):
-        raise ValueError("config agent must be a non-empty argv list")
-    return argv
-
-
-def agent_prompt(s, turns, message):
-    tasks = {kind: [{"i": i, "title": x["title"], "due": x["due"], "done": x["done"]}
-                    for i, x in enumerate(s[kind])] for kind in KINDS}
-    return (
-        "You help change a todo list. You have no tools; the app applies changes after user confirmation.\n"
-        "daily repeats every day, due HH:MM, and is unchecked at midnight. "
-        "weekly repeats every week, due ddd HH:MM (e.g. fri 09:00), and is unchecked on Mondays. "
-        "todo is one-off, due YYYY-MM-DD HH:MM (17:00 if the user gives no time), and done todos are purged at midnight. "
-        "Titles may contain markdown links [text](url). Indices i refer to the tasks shown.\n"
-        "Reply with ONLY a JSON object: "
-        '{"reply":"short message to the user","ops":['
-        '{"op":"add","kind":"todo|daily|weekly","title":"...","due":"..."},'
-        '{"op":"edit","kind":"todo|daily|weekly","i":0,"title":"...","due":"...","done":true},'
-        '{"op":"delete","kind":"todo|daily|weekly","i":0}]}. '
-        "kind is todo, daily or weekly. For edit, include only fields to change. "
-        "Use ops: [] when just answering.\n"
-        f"Local time: {now():%Y-%m-%d %H:%M %A}\n"
-        f"Tasks: {json.dumps(tasks, ensure_ascii=False)}\n"
-        f"Chat so far: {json.dumps(turns, ensure_ascii=False)}\n"
-        f"New user message: {message}"
-    )
-
-
-def parse_agent_reply(raw):
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("no JSON object")
-    data = json.loads(raw[start:end + 1])
-    if not isinstance(data, dict) or not isinstance(data.get("reply"), str) or not isinstance(data.get("ops"), list):
-        raise ValueError("expected reply string and ops list")
-    return data
-
-
-def call_agent(argv, message):
-    # ponytail: blocking call, no spinner/cancel; add async execution if 120 seconds becomes painful
-    try:
-        result = subprocess.run(argv, input=message, capture_output=True, text=True, timeout=120, check=False)
+        r = subprocess.run(DRAFTER, input=ask, capture_output=True, text=True, timeout=30, check=False)
     except OSError as e:
-        return None, f"agent failed to start: {e}"
+        return None, f"drafter failed to start: {e}"
     except subprocess.TimeoutExpired:
-        return None, "agent timed out"
-    if result.returncode:
-        detail = result.stderr.strip().splitlines()
-        error = f"agent exited {result.returncode}: {detail[-1] if detail else 'no stderr'}"
-        return None, error
+        return None, "drafter timed out"
+    if r.returncode:
+        detail = r.stderr.strip().splitlines()
+        return None, f"drafter exited {r.returncode}: {detail[-1] if detail else 'no stderr'}"
+    text = " ".join(r.stdout.replace("\0", " ").split())
+    return (text, None) if text else (None, "empty draft")
+
+
+def herdr(*args):
     try:
-        return parse_agent_reply(result.stdout), None
-    except ValueError as e:
-        return None, f"invalid agent reply: {e}"
-
-
-def validate_op(raw, s, t, used):
-    if not isinstance(raw, dict):
-        raise ValueError("op must be an object")
-    action, kind = raw.get("op"), raw.get("kind")
-    if action not in ("add", "edit", "delete") or kind not in KINDS:
-        raise ValueError("invalid op or kind")
-    op = {"op": action, "kind": kind}
-    if action != "add":
-        i = raw.get("i")
-        if type(i) is not int or not 0 <= i < len(s[kind]):
-            raise ValueError("index out of range")
-        if (kind, i) in used:
-            raise ValueError("duplicate task index")
-        op["i"] = i
-    if action == "edit" and not any(k in raw for k in ("title", "due", "done")):
-        raise ValueError("edit needs a field")
-    if action == "add" or action == "edit" and "title" in raw:
-        title = raw.get("title")
-        if not isinstance(title, str) or not title.strip():
-            raise ValueError("title required")
-        if not title.isprintable():
-            raise ValueError("title has control characters")
-        op["title"] = title.strip()
-    if action == "add" or action == "edit" and "due" in raw:
-        due = raw.get("due")
-        if not isinstance(due, str):
-            raise ValueError("due must be text")
-        due = parse_due(kind, due, t.date())
-        if kind == "todo" and (action == "add" or due != s[kind][op["i"]]["due"]) and due_at(kind, {"due": due}, t.date()) <= t:
-            raise ValueError("due is in the past")
-        op["due"] = due
-    if action == "edit" and "done" in raw:
-        if type(raw["done"]) is not bool:
-            raise ValueError("done must be boolean")
-        op["done"] = raw["done"]
-    if action != "add":
-        used.add((kind, op["i"]))
-    return op
-
-
-def validate_ops(raw_ops, s, t, used):
-    valid, invalid = [], []
-    for raw in raw_ops:
+        r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=90, check=False)
+    except OSError as e:
+        raise RuntimeError(f"herdr failed to start: {e}")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"herdr {args[0]} {args[1]} timed out")
+    if r.returncode:
         try:
-            valid.append(validate_op(raw, s, t, used))
-        except (ValueError, OverflowError) as e:
-            invalid.append((raw, str(e)))
-    return valid, invalid
-
-
-def propose(argv, prompt_text, s, t):
-    answer, error = call_agent(argv, prompt_text)
-    if error:
-        return None, [], [], error
-    used = set()
-    valid, pending = validate_ops(answer["ops"], s, t, used)
-    for n in range(3):
-        if not pending:
-            break
-        errors = [{"op": raw, "error": why} for raw, why in pending]
-        log.info("agent retry %d: %s", n + 1, json.dumps(errors, ensure_ascii=False))
-        retry = (prompt_text + "\nInvalid ops: " + json.dumps(errors, ensure_ascii=False)
-                 + "\nReturn the same JSON shape with corrected replacements for ONLY those invalid ops, in order.")
-        fixed, error = call_agent(argv, retry)
-        if error:
-            break
-        replacements = fixed["ops"][:len(pending)]
-        added, bad = validate_ops(replacements, s, t, used)
-        valid.extend(added)
-        pending = bad + pending[len(replacements):]
-    return answer["reply"], valid, pending, error
-
-
-def apply_ops(s, ops):
-    fresh = reload(s)
-    if fresh is None:
-        return None
-    for op in (x for x in ops if x["op"] == "edit"):
-        task = fresh[op["kind"]][op["i"]]
-        if "due" in op and op["due"] != task["due"]:
-            task["sent"] = fresh_sent(op["kind"], op["due"], now())
-        if op.get("done") and not task["done"]:
-            task["done_on"] = now().date().isoformat()
-        task.update({k: v for k, v in op.items() if k in ("title", "due", "done")})
-        log.info("agent edited %s: %s (due %s)", op["kind"], task["title"], task["due"])
-    for op in sorted((x for x in ops if x["op"] == "delete"), key=lambda x: x["i"], reverse=True):
-        log.info("agent deleted %s: %s", op["kind"], fresh[op["kind"]].pop(op["i"])["title"])
-    for op in ops:
-        if op["op"] == "add":
-            fresh[op["kind"]].append({"title": op["title"], "due": op["due"], "done": False,
-                                      "sent": fresh_sent(op["kind"], op["due"], now())})
-            log.info("agent added %s: %s (due %s)", op["kind"], op["title"], op["due"])
-    save(fresh)
-    return fresh
+            msg = json.loads(r.stderr)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            detail = r.stderr.strip().splitlines()
+            msg = detail[-1] if detail else f"herdr exited {r.returncode}"
+        raise RuntimeError(msg)
+    return json.loads(r.stdout).get("result") or {}
 
 
 # ---------- TUI ----------
@@ -411,7 +294,7 @@ def shimmer(scr, s, f):
             put(scr, 1, BAR_X + x, "━", curses.A_BOLD if x == head else C(YELLOW) | curses.A_BOLD)
 
 
-def draw(scr, s, cur, t):
+def draw(scr, s, cur, t, status=None):
     """Render the list; returns the screen row of each task, in cursor order."""
     scr.erase()
     h, w = scr.getmaxyx()
@@ -451,7 +334,7 @@ def draw(scr, s, cur, t):
             ys.append(y)
             y += 1
         y += 1
-    put(scr, h - 1, 1, HELP, curses.A_DIM)
+    put(scr, h - 1, 1, status or HELP, curses.A_BOLD if status else curses.A_DIM)
     return ys
 
 
@@ -593,7 +476,7 @@ def celebrate(scr, s, cur, kind, i, y):
         play(scr, s, cur, 45, fx)
 
 
-def draw_chat(scr, s, cur, transcript):
+def draw_panel(scr, s, cur, title, lines, focus=0):
     draw(scr, s, cur, now())
     h, w = scr.getmaxyx()
     top = max(2, h - max(4, h // 3))
@@ -601,73 +484,117 @@ def draw_chat(scr, s, cur, transcript):
         scr.move(top, 0)
         scr.clrtobot()
     put(scr, top, 1, "─" * (w - 2), C(CYAN) | curses.A_DIM)
-    put(scr, top, 2, " chat ", C(CYAN) | curses.A_BOLD)
-    lines = []
-    for role, message in transcript:
-        line = f"{role}: {message}" if role else message
-        lines.extend(textwrap.wrap(line.replace("\0", ""), width=max(1, w - 2)) or [""])
-    for y, line in zip(range(top + 1, h - 1), lines[-(h - top - 2):]):
+    put(scr, top, 2, f' spawn agent · "{title}" ', C(CYAN) | curses.A_BOLD)
+    rows = h - top - 2
+    start = max(0, focus - rows + 1)
+    # ponytail: no scrolling; long suggestions clip at the panel bottom (drafter is asked for <80 words)
+    for y, line in zip(range(top + 1, h - 1), lines[:1] + lines[1 + start:]):
         put(scr, y, 1, line)
+    scr.refresh()
 
 
-def proposal_line(op, s):
-    kind = op["kind"]
-    # done=True: label() without the OVERDUE/missed prefix
-    show = {"title": plain, "due": lambda d: label(kind, {"due": d, "done": True}, now())[0], "done": str}
-    if op["op"] == "add":
-        return f'+ {kind} "{plain(op["title"])}" due {show["due"](op["due"])}'
-    old = plain(s[kind][op["i"]]["title"])
-    if op["op"] == "delete":
-        return f'- {kind} "{old}"'
-    return f'~ {kind} "{old}": ' + ", ".join(f"{k} → {show[k](op[k])}" for k in ("title", "due", "done") if k in op)
+def pick(scr, panel, question, items, search=False):
+    """Menu in the panel. Digits or j/k + Enter pick. With search=True typed text filters instead (every
+    space-separated term a case-insensitive substring) and only the arrow keys move. Esc returns None."""
+    c, q = 0, ""
+    scr.timeout(-1)
+    try:
+        while True:
+            hits = [i for i, x in enumerate(items) if all(t in x.lower() for t in q.lower().split())]
+            c = max(0, min(c, len(hits) - 1))
+            panel([question + (f" {q}_" if search else "")]
+                  + [f"{'▸' if n == c else ' '} " + ("" if search else f"{n + 1} ") + items[i] for n, i in enumerate(hits)], c + 1)
+            ch = scr.get_wch()
+            if ch == "\x1b":
+                return None
+            if ch in ("\n", "\r", curses.KEY_ENTER):
+                if hits:
+                    return hits[c]
+            elif ch == curses.KEY_DOWN or (not search and ch == "j"):
+                c += 1
+            elif ch == curses.KEY_UP or (not search and ch == "k"):
+                c -= 1
+            elif not search and isinstance(ch, str) and ch in "123456789" and int(ch) <= len(hits):
+                return hits[int(ch) - 1]
+            elif search and ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                q = q[:-1]
+            elif search and isinstance(ch, str) and ch.isprintable():
+                q += ch
+    finally:
+        scr.timeout(1000)
 
 
-def chat(scr, cur):
-    transcript = []
-    while True:
-        s = load()
-        draw_chat(scr, s, cur, transcript)
-        message = prompt(scr, "you: ")
-        if not message:
-            return
-        turns = [{"role": role, "text": line} for role, line in transcript if role in ("you", "agent")]
-        prompt_text = agent_prompt(s, turns, message)
-        transcript.append(("you", message))
-        log.info("agent asked: %s", message)
-        draw_chat(scr, s, cur, transcript + [(None, "thinking…")])
-        scr.refresh()
-        try:
-            argv = agent_argv()
-        except (ValueError, OSError) as e:
-            log.error("agent config: %s", e)
-            transcript.append((None, f"✗ config: {e}"))
-            continue
-        reply, ops, skipped, error = propose(argv, prompt_text, s, now())
+def spawn(scr, s, cur, task):
+    title = plain(task["title"])
+    if os.environ.get("HERDR_ENV") != "1":
+        log.info("spawn: not inside herdr")
+        return "✗ needs herdr"
+
+    def panel(lines, focus=0):
+        draw_panel(scr, s, cur, title, lines, focus)
+    try:
+        spaces = herdr("workspace", "list")["workspaces"]
+    except (RuntimeError, ValueError, KeyError) as e:
+        log.error("herdr workspace list: %s", e)
+        return f"✗ {e}"
+    home = str(Path.home())
+    items = [w["label"] + (f'  {w["worktree"]["checkout_path"].replace(home, "~", 1)}' if w.get("worktree") else "") for w in spaces]
+    i = pick(scr, panel, "workspace?", items, search=True)
+    if i is None:
+        return None
+    ws = spaces[i]
+    checkout = (ws.get("worktree") or {}).get("checkout_path")
+    how = pick(scr, panel, "how?", ["new tab in it", "new worktree off it"]) if checkout else 0
+    if how is None:
+        return None
+    if how == 1:
+        branch = prompt(scr, "branch: ", slug(task["title"]))
+        if not branch:
+            return None
+        cwd = str(Path(checkout).parent / branch)          # sibling of the checkout
+    else:
+        cwd = checkout or ws["label"]                      # draft context only; herdr picks a non-git tab's dir
+    h = pick(scr, panel, "harness?", list(MODELS))
+    if h is None:
+        return None
+    harness = list(MODELS)[h]
+    m = pick(scr, panel, "model?", MODELS[harness] + ["other…"])
+    if m is None:
+        return None
+    model = MODELS[harness][m] if m < len(MODELS[harness]) else prompt(scr, "model: ")
+    if not model:
+        return None
+    panel(["drafting prompt…"])
+    text, error = draft(task["title"], cwd)
+    curses.flushinp()
+    if error:
+        log.error("draft: %s", error)
+    panel(textwrap.wrap(text, max(1, scr.getmaxyx()[1] - 2)) if text else [f"✗ {error}"])
+    typed = prompt(scr, "prompt (enter = suggested): " if text else "prompt: ")
+    if typed is None or not (typed or text):
+        return None
+    p = typed or text
+    # `--` / `--prompt=` so a prompt starting with `-` is never parsed as a flag
+    argv = [harness, "--model", model] + ([f"--prompt={p}"] if harness == "opencode" else ["--", p])
+    panel([f"spawning {harness} · {model} · {cwd}…"])
+    # ponytail: blocking; worktree create freezes the clock a few seconds. thread it if that bites
+    # ponytail: prompt rides the shell command line; if >1KB prompts get eaten during shell startup,
+    # switch to agent start + agent prompt
+    try:
+        if how == 1:
+            r = herdr("worktree", "create", "--workspace", ws["workspace_id"], "--branch", branch,
+                      "--path", cwd, "--label", branch, "--no-focus")
+        else:   # `--label=` so a title starting with `-` is not a flag
+            r = herdr("tab", "create", "--workspace", ws["workspace_id"], *(["--cwd", checkout] if checkout else []),
+                      f"--label={title}", "--no-focus")
+        herdr("pane", "run", r["root_pane"]["pane_id"], shlex.join(argv))
+    except (RuntimeError, ValueError, KeyError) as e:
+        log.error("spawn in %s failed: %s", cwd, e)
+        return f"✗ {e}"
+    finally:
         curses.flushinp()
-        if error:
-            log.error("agent: %s", error)
-        if reply is None:
-            transcript.append((None, f"✗ {error}"))
-            continue
-        transcript.append(("agent", reply))
-        if error:
-            transcript.append((None, f"✗ {error}"))
-        for op in ops:
-            transcript.append((None, proposal_line(op, s)))
-        for raw, why in skipped:
-            transcript.append((None, f"✗ skipped: {json.dumps(raw, ensure_ascii=False)} ({why})"))
-        if ops:
-            draw_chat(scr, s, cur, transcript)
-            n = f"{len(ops)} change{'s' * (len(ops) != 1)}"
-            if confirm(scr, f"apply {n}? y/n"):
-                if apply_ops(s, ops) is None:
-                    log.info("agent batch not applied: midnight rollover")
-                    transcript.append((None, "list changed at midnight, not applied"))
-                else:
-                    transcript.append((None, f"applied {n}"))
-            else:
-                log.info("agent batch declined: %s", n)
-                transcript.append((None, "not applied"))
+    log.info("spawned %s %s in %s: %s", harness, model, cwd, p)
+    return f"→ {harness} · {model} · " + (cwd.replace(home, "~", 1) if how == 1 else f'{ws["label"]} (new tab)')
 
 
 def tui(scr):
@@ -678,13 +605,15 @@ def tui(scr):
                                curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_BLUE), 1):
         curses.init_pair(n, color, -1)
     scr.timeout(1000)  # tick every second: clock, due colors, midnight rollover
-    cur = 0
+    cur, msg = 0, None
     while True:
         s = load()
         rows = [(k, i) for k in KINDS for i in range(len(s[k]))]
         cur = max(0, min(cur, len(rows) - 1))
-        ys = draw(scr, s, cur, now())
+        ys = draw(scr, s, cur, now(), msg)
         ch = scr.getch()
+        if ch != -1:
+            msg = None
         # every write reloads first so it doesn't clobber what the notifier just saved
         if ch == ord("q"):
             return
@@ -692,8 +621,6 @@ def tui(scr):
             cur += 1
         elif ch in (ord("k"), curses.KEY_UP):
             cur -= 1
-        elif ch == ord("c"):
-            chat(scr, cur)
         elif ch in (ord("a"), ord("r"), ord("w")):
             kind = {ord("a"): "todo", ord("r"): "daily", ord("w"): "weekly"}[ch]
             got = ask_task(scr, kind)
@@ -717,6 +644,8 @@ def tui(scr):
                     log.info("%s: %s", "done" if task["done"] else "undone", task["title"])
                     if task["done"]:
                         celebrate(scr, s, cur, kind, i, ys[cur])
+            elif ch == ord("c"):
+                msg = spawn(scr, s, cur, task)
             elif ch == ord("e"):
                 got = ask_task(scr, kind, task)
                 s = reload(s) if got else None
