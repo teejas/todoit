@@ -324,7 +324,7 @@ def apply_ops(s, ops):
         if "due" in op and op["due"] != task["due"]:
             task["sent"] = fresh_sent(op["kind"], op["due"], now())
         if op.get("done") and not task["done"]:
-            task["done_on"] = now().date().isoformat()
+            task["done_on"] = f"{now():%Y-%m-%d %H:%M}"
         task.update({k: v for k, v in op.items() if k in ("title", "due", "done")})
         log.info("agent edited %s: %s (due %s)", op["kind"], task["title"], task["due"])
     for op in sorted((x for x in ops if x["op"] == "delete"), key=lambda x: x["i"], reverse=True):
@@ -376,6 +376,9 @@ def label(kind, task, t):
         day = {0: "today", 1: "tomorrow"}.get(days) or (f"{due:%a}" if 1 < days < 7 else f"{due:%-m/%-d}")
         text = f"{day} {due:%H:%M}"
     if task["done"]:
+        if len(task.get("done_on", "")) > 10:  # date-only stamps predate completion times
+            at = datetime.strptime(task["done_on"], "%Y-%m-%d %H:%M")
+            text = f"done {at:%H:%M}" if at.date() == t.date() else f"done {at:%a %H:%M}"
         return text, C(GREEN) | curses.A_DIM
     if t >= due:
         return ("OVERDUE " if kind == "todo" else "missed ") + text, C(RED) | curses.A_BOLD
@@ -389,7 +392,7 @@ def momentum(s, t):
     tasks = [(k, x, due_at(k, x, t.date())) for k in KINDS for x in s[k]]
     plate = [x for k, x, d in tasks
              if d.date() == t.date() or (not x["done"] and t >= d)
-             or (x["done"] and x.get("done_on") == t.date().isoformat())]
+             or (x["done"] and x.get("done_on", "")[:10] == t.date().isoformat())]
     dues = [d for _, x, d in tasks if not x["done"]]
     return (sum(x["done"] for x in plate), len(plate),
             sum(t < d and d.date() == t.date() for d in dues), sum(t >= d for d in dues))
@@ -712,7 +715,7 @@ def tui(scr):
                     task = s[kind][i]
                     task["done"] = not task["done"]
                     if task["done"]:
-                        task["done_on"] = now().date().isoformat()
+                        task["done_on"] = f"{now():%Y-%m-%d %H:%M}"
                     save(s)
                     log.info("%s: %s", "done" if task["done"] else "undone", task["title"])
                     if task["done"]:

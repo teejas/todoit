@@ -215,6 +215,9 @@ class Display(unittest.TestCase):
             ("todo", task("a", "2026-09-27 17:00"), "OVERDUE 9/27 17:00"),
             ("daily", task("a", "12:00"), "missed 12:00"),
             ("daily", task("a", "12:00", done=True), "12:00"),
+            ("daily", task("a", "12:00", done=True, done_on="2026-09-28"), "12:00"),  # date-only stamp
+            ("daily", task("a", "12:00", done=True, done_on="2026-09-28 11:42"), "done 11:42"),
+            ("weekly", task("a", "fri 17:00", done=True, done_on="2026-09-26 18:05"), "done Sat 18:05"),
             ("daily", task("a", "17:00"), "17:00"),
             ("weekly", task("a", "fri 17:00"), "Fri 17:00"),
             ("weekly", task("a", "mon 09:00"), "missed Mon 09:00"),
@@ -278,6 +281,8 @@ class Display(unittest.TestCase):
             ("mon 17:00", False, None, (0, 1, 0, 1)),
             ("fri 17:00", False, None, (0, 0, 0, 0)),
             ("fri 17:00", True, "2026-09-30", (1, 1, 0, 0)),
+            ("fri 17:00", True, "2026-09-30 08:15", (1, 1, 0, 0)),
+            ("mon 17:00", True, "2026-09-28 17:30", (0, 0, 0, 0)),
         ]:
             self.assertEqual(todoit.momentum(state(weekly=[task("weekly", due, done, done_on=done_on)]),
                                              at(30, 12, 0)), want)
@@ -435,7 +440,7 @@ class Agent(unittest.TestCase):
             todoit.save(s)
             applied = todoit.apply_ops(s, [op])
             self.assertTrue(applied["todo"][0]["done"])
-            self.assertEqual(applied["todo"][0]["done_on"], "2026-09-28")
+            self.assertEqual(applied["todo"][0]["done_on"], "2026-09-28 19:00")
             self.assertEqual(todoit.momentum(applied, at(28, 19, 0)), (1, 1, 0, 0))
 
     def test_propose_returns_call_errors(self):
