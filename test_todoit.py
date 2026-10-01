@@ -31,6 +31,7 @@ def state(**kw):
 HOME = Path.home()
 TASK = task("Review [PR 41](https://x.io/pr/41)!", "2026-09-30 17:00")
 CHECKOUT = str(HOME / "vapi/repo/main")
+FEAT = str(HOME / "vapi/repo/feat")
 WT = str(HOME / "vapi/repo/review-pr-41")
 
 
@@ -38,8 +39,11 @@ def ok(result):
     return subprocess.CompletedProcess([], 0, json.dumps({"result": result, "id": "x"}), "")
 
 
-LIST = ok({"workspaces": [{"workspace_id": "wN", "label": "repo", "worktree": {"checkout_path": CHECKOUT}},
-                          {"workspace_id": "wX", "label": "plain", "worktree": None}]})
+LIST = ok({"workspaces": [{"workspace_id": "wN", "label": "repo",
+                          "worktree": {"checkout_path": CHECKOUT, "is_linked_worktree": False}},
+                          {"workspace_id": "wX", "label": "plain", "worktree": None},
+                          {"workspace_id": "wL", "label": "feat",
+                           "worktree": {"checkout_path": FEAT, "is_linked_worktree": True}}]})
 CREATED = ok({"root_pane": {"pane_id": "w9:p1"}, "tab": {"tab_id": "w9:t1"}})
 RAN = ok({"type": "ok"})
 WS_LIST = [["herdr", "workspace", "list"]]
@@ -418,22 +422,32 @@ class Spawn(unittest.TestCase):
     def test_tab_in_git_workspace(self):
         result, argvs, m = self.spawn([0, 0, 1, 0], [""], runs=[LIST, CREATED, RAN])
         self.assertEqual(argvs, WS_LIST + [
-            ["herdr", "tab", "create", "--workspace", "wN", "--cwd", CHECKOUT, "--label=Review PR 41!", "--no-focus"],
+            ["herdr", "tab", "create", "--workspace", "wN", "--cwd", CHECKOUT, "--label", "Review PR 41!", "--no-focus"],
             ["herdr", "pane", "run", "w9:p1", shlex.join(["codex", "--model", "gpt-6.1-sol", "--", "Fix it"])]])
         self.assertEqual(result, "→ codex · gpt-6.1-sol · repo (new tab)")
         m["draft"].assert_called_once_with(TASK["title"], CHECKOUT)
-        self.assertEqual(m["pick"].call_args_list[0].args[2:], ("workspace?", ["repo  ~/vapi/repo/main", "plain"]))
+        self.assertEqual(m["pick"].call_args_list[0].args[2:],
+                         ("workspace?", ["repo  ~/vapi/repo/main", "plain", "feat  ~/vapi/repo/feat"]))
         self.assertEqual(m["pick"].call_args_list[0].kwargs, {"search": True})
         self.assertEqual(m["pick"].call_args_list[1].args[2:], ("how?", ["new tab in it", "new worktree off it"]))
 
     def test_tab_in_non_git_workspace_skips_how(self):
         result, argvs, m = self.spawn([1, 2, 0], [""], runs=[LIST, CREATED, RAN])
         self.assertEqual(argvs, WS_LIST + [
-            ["herdr", "tab", "create", "--workspace", "wX", "--label=Review PR 41!", "--no-focus"],
+            ["herdr", "tab", "create", "--workspace", "wX", "--label", "Review PR 41!", "--no-focus"],
             ["herdr", "pane", "run", "w9:p1", shlex.join(["opencode", "--model", "opencode/claude-opus-5-5", "--prompt=Fix it"])]])
         self.assertEqual(result, "→ opencode · opencode/claude-opus-5-5 · plain (new tab)")
         self.assertEqual([c.args[2] for c in m["pick"].call_args_list], ["workspace?", "harness?", "model?"])
         m["draft"].assert_called_once_with(TASK["title"], "plain")
+
+    def test_tab_in_linked_worktree_skips_how(self):
+        result, argvs, m = self.spawn([2, 0, 0], [""], runs=[LIST, CREATED, RAN])
+        self.assertEqual(argvs, WS_LIST + [
+            ["herdr", "tab", "create", "--workspace", "wL", "--cwd", FEAT, "--label", "Review PR 41!", "--no-focus"],
+            ["herdr", "pane", "run", "w9:p1", shlex.join(["claude", "--model", "claude-opus-5-5", "--", "Fix it"])]])
+        self.assertEqual(result, "→ claude · claude-opus-5-5 · feat (new tab)")
+        self.assertEqual([c.args[2] for c in m["pick"].call_args_list], ["workspace?", "harness?", "model?"])
+        m["draft"].assert_called_once_with(TASK["title"], FEAT)
 
     def test_other_model_is_prompted(self):
         result, argvs, _ = self.spawn([0, 0, 1, 3], ["gpt-x", "it's $HOME"], drafted=("suggested", None),

@@ -543,8 +543,11 @@ def spawn(scr, s, cur, task):
     if i is None:
         return None
     ws = spaces[i]
-    checkout = (ws.get("worktree") or {}).get("checkout_path")
-    how = pick(scr, panel, "how?", ["new tab in it", "new worktree off it"]) if checkout else 0
+    wt = ws.get("worktree") or {}
+    checkout = wt.get("checkout_path")
+    # herdr only creates worktrees from the repo's main checkout workspace.
+    how = (pick(scr, panel, "how?", ["new tab in it", "new worktree off it"])
+           if checkout and not wt.get("is_linked_worktree") else 0)
     if how is None:
         return None
     if how == 1:
@@ -584,9 +587,9 @@ def spawn(scr, s, cur, task):
         if how == 1:
             r = herdr("worktree", "create", "--workspace", ws["workspace_id"], "--branch", branch,
                       "--path", cwd, "--label", branch, "--no-focus")
-        else:   # `--label=` so a title starting with `-` is not a flag
+        else:
             r = herdr("tab", "create", "--workspace", ws["workspace_id"], *(["--cwd", checkout] if checkout else []),
-                      f"--label={title}", "--no-focus")
+                      "--label", title, "--no-focus")
         herdr("pane", "run", r["root_pane"]["pane_id"], shlex.join(argv))
     except (RuntimeError, ValueError, KeyError) as e:
         log.error("spawn in %s failed: %s", cwd, e)
@@ -612,7 +615,7 @@ def tui(scr):
         cur = max(0, min(cur, len(rows) - 1))
         ys = draw(scr, s, cur, now(), msg)
         ch = scr.getch()
-        if ch != -1:
+        if ch not in (-1, curses.KEY_RESIZE):
             msg = None
         # every write reloads first so it doesn't clobber what the notifier just saved
         if ch == ord("q"):
