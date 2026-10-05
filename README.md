@@ -19,3 +19,24 @@ Log: `~/.todoit/todoit.log` (banners sent/failed, midnight resets, adds/edits/de
 Set `TODOIT_HOME` to use a different data dir (re-run `make install` so the notifier follows).
 
 **Agent:** Press `c` on a task to spawn a coding agent on it. Todoit must run inside herdr (`HERDR_ENV=1`), otherwise it shows `✗ needs herdr`. Pick an open herdr workspace (type to filter; todoit never creates workspaces, so open one in herdr first). Workspaces on machines saved with `herdr machine add` (enabled ones) are listed after the local ones, prefixed with the machine label (`mac-mini · arch-world`), so typing the label filters to them; a machine that is asleep or unreachable is skipped after ~3s (logged) and the rest still show. A repo's main-checkout workspace offers a new tab in it or a new worktree off it (branch prefilled from the title, created next to the checkout: `~/vapi/repo/main` → `~/vapi/repo/<branch>`); other worktrees and non-git workspaces get a new tab (herdr only creates worktrees from the repo's main workspace). Then pick a harness (claude/codex), a model (presets or `other…`), and a prompt drafted by `claude -p --model claude-sonnet-5-5 --tools '' --no-session-persistence --strict-mcp-config --setting-sources ''`. The last two flags keep your plugins, hooks and MCP servers out of the call; with them loaded, each turn sends ~230K+ tokens and takes ~9s instead of ~3.5s. Enter or → accepts and moves on, typing replaces the suggestion. ← goes back a step (earlier answers and typed prompt text are kept; the drafted prompt is reused for the same directory); a blank branch/model answer stays put, a blank prompt accepts the suggestion. Esc clears what you typed and Esc Esc at any step returns to the list; nothing is created until the prompt is submitted. The agent starts in the new tab's or worktree's pane with the prompt, on the machine that owns the workspace (herdr runs there via `ssh -n -o BatchMode=yes`, so `herdr` must be on that machine's non-interactive ssh PATH and `claude`/`codex` on its interactive shell PATH; the prompt is always drafted locally); focus stays in todoit.
+
+## Sync via Google Sheet (optional)
+
+1. Make a Google Sheet on a personal Gmail account. Set its timezone (File → Settings) and the Apps Script project timezone to your Mac's.
+2. Extensions → Apps Script: paste [sheet/Code.gs](sheet/Code.gs), set `TOKEN` to a secret in Project Settings → Script Properties, then run `setup()` once (creates `tasks`, `meta` and a midnight reset trigger).
+3. Deploy → New deployment → Web app: execute as **Me**, access **Anyone**. Copy the `/exec` URL.
+4. Write `~/.todoit/config.json` (or `$TODOIT_HOME/config.json`), then `chmod 600` it:
+
+```json
+{"store": "sheet", "url": "<web app /exec URL>", "token": "<same secret>"}
+```
+
+Edit the `tasks` tab from the phone; leave `id`, `sent` and `sent_for` alone. Bad cells get validation warnings; bad rows are skipped in the TUI. Refresh happens on idle ticks after 30s; writes wait for the sheet. Banners still need the Mac and a connection. Remove config.json to use local tasks.json again; rotate the secret in both config and Script Properties.
+
+**Redeploy trap:** after changing the script, Manage deployments → Edit → **New version** updates the existing URL. A new deployment gets a new URL.
+
+Import existing tasks.json after configuring sync (run from this repo; keeps IDs so retries don't duplicate tasks):
+
+```sh
+python3 -c 'import todoit; s = todoit.LocalStore().load(); remote = todoit.store(); [remote.add(k, t) for k in todoit.KINDS for t in s[k]]'
+```

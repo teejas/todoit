@@ -21,6 +21,8 @@ import time
 import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.request import Request, urlopen
+from uuid import uuid4
 
 DB = Path(os.environ.get("TODOIT_HOME", Path.home() / ".todoit")) / "tasks.json"
 # skip user settings (plugins, hooks) and MCP servers: inheriting them is ~230K+ input tokens and ~9s per turn vs ~3.5s
@@ -145,6 +147,9 @@ def check(s, t):
     """Send each banner at most once (dailies re-arm at midnight, weeklies on Monday)."""
     for kind in KINDS:
         for task in s[kind]:
+            if task.get("sent_for") != task["due"]:
+                task["sent"] = fresh_sent(kind, task["due"], t)
+                task["sent_for"] = task["due"]
             due = due_at(kind, task, t.date())
             if task["done"] or t < due - HEADS_UP:
                 continue
@@ -158,24 +163,44 @@ def check(s, t):
                 notify(title, plain(task["title"]), sound)
 
 
-def load():
-    t = now()
-    try:
-        s = json.loads(DB.read_text())
-    except FileNotFoundError:
-        log.info("no %s yet, starting empty", DB)
-        s = {"last_reset": t.date().isoformat(), "daily": [], "weekly": [], "todo": []}
-        save(s)
-    s.setdefault("weekly", [])
-    if rollover(s, t):
-        save(s)
-    return s
+def new_id():
+    return "t" + uuid4().hex[:8]
 
 
-def reload(old):
-    """Fresh state for a write, or None if a midnight rollover reshuffled the lists since `old` was drawn."""
-    s = load()
-    return s if s["last_reset"] == old["last_reset"] else None
+def normalise(s, t):
+    """Canonicalise valid rows; keep bad rows in the backing store, out of the TUI."""
+    clean = {"last_reset": s["last_reset"]}
+    bad = s.get("bad_rows", 0)
+    for kind in KINDS:
+        clean[kind] = []
+        for i, row in enumerate(s.setdefault(kind, [])):
+            try:
+                task = dict(row)
+                if not isinstance(task["title"], str) or not task["title"].strip():
+                    raise ValueError("title required")
+                if kind != "todo":
+                    task["due"] = parse_due(kind, task["due"], t.date())
+                due = due_at(kind, task, t.date())
+                if kind == "todo" and task["due"] != f"{due:%Y-%m-%d %H:%M}":
+                    raise ValueError("todo due must be YYYY-MM-DD HH:MM")
+                task["done"] = task.get("done", False) in (True, "TRUE")
+                if not task.get("id"):
+                    task["id"] = new_id()
+                task.setdefault("sent_for", task["due"])
+                sent = task.get("sent", [])
+                task["sent"] = json.loads(sent or "[]") if isinstance(sent, str) else sent
+                if not isinstance(task["sent"], list) or any(x not in ("soon", "missed") for x in task["sent"]):
+                    raise ValueError("bad sent")
+                stamp = task.get("done_on", "")
+                if not isinstance(stamp, str):
+                    raise ValueError("bad done_on")
+                if stamp:
+                    datetime.strptime(stamp, "%Y-%m-%d" if len(stamp) == 10 else "%Y-%m-%d %H:%M")
+                s[kind][i] = task
+                clean[kind].append(task)
+            except (ValueError, TypeError, KeyError, AttributeError, StopIteration, OverflowError):
+                bad += 1
+    return clean, bad
 
 
 def save(s):
@@ -185,6 +210,123 @@ def save(s):
     with os.fdopen(fd, "w") as f:
         json.dump(s, f, indent=2, ensure_ascii=False)
     os.replace(tmp, DB)  # atomic swap: a crash mid-write can't truncate tasks.json
+
+
+class LocalStore:
+    bad_rows = 0
+
+    def load(self):
+        t = now()
+        try:
+            self.raw = json.loads(DB.read_text())
+        except FileNotFoundError:
+            log.info("no %s yet, starting empty", DB)
+            self.raw = {"last_reset": t.date().isoformat(), **{k: [] for k in KINDS}}
+            save(self.raw)
+        before = json.dumps(self.raw)
+        s, self.bad_rows = normalise(self.raw, t)
+        purged = {x["id"] for x in s["todo"] if x["done"]}
+        if rollover(s, t):
+            self.raw["last_reset"] = s["last_reset"]
+            self.raw["todo"] = [x for x in self.raw["todo"] if not isinstance(x, dict) or x.get("id") not in purged]
+        if json.dumps(self.raw) != before:
+            save(self.raw)
+        return s
+
+    def finish(self):
+        s, self.bad_rows = normalise(self.raw, now())
+        save(self.raw)
+        return s
+
+    def add(self, kind, task):
+        s = self.load()
+        if any(x["id"] == task["id"] for k in KINDS for x in s[k]):
+            return s
+        self.raw[kind].append(dict(task))
+        return self.finish()
+
+    def update(self, id, fields):
+        s = self.load()
+        for kind in KINDS:
+            for task in s[kind]:
+                if task["id"] == id:
+                    task.update(fields)
+                    return self.finish()
+        raise RuntimeError("task gone")
+
+    def delete(self, id):
+        s = self.load()
+        for kind in KINDS:
+            for task in s[kind]:
+                if task["id"] == id:
+                    self.raw[kind].remove(task)
+                    return self.finish()
+        raise RuntimeError("task gone")
+
+
+class SheetStore:
+    bad_rows = 0
+
+    def __init__(self, url, token):
+        self.url, self.token = url, token
+
+    def call(self, op, **fields):
+        body = json.dumps({"token": self.token, "op": op, **fields}).encode()
+        req = Request(self.url, data=body, headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=10) as response:
+            try:
+                result = json.loads(response.read())
+            except (ValueError, UnicodeError):
+                raise RuntimeError("sheet returned non-JSON; check web app deployment/access") from None
+        if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+            raise RuntimeError("sheet response needs a JSON ok field")
+        if not result["ok"]:
+            raise RuntimeError(result.get("error", "sheet error"))
+        try:
+            s, self.bad_rows = normalise(result["state"], now())
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise RuntimeError("bad sheet state") from None
+        for task in result.get("missed", []):
+            when = task["due"].capitalize() if task["kind"] == "weekly" else task["due"]
+            notify(f"❌ missed · was due {when}", plain(task["title"]), "Basso")
+        return s
+
+    def load(self):
+        return self.call("load")
+
+    def add(self, kind, task):
+        return self.call("add", kind=kind, task=task)
+
+    def update(self, id, fields):
+        return self.call("update", id=id, fields=fields)
+
+    def delete(self, id):
+        return self.call("delete", id=id)
+
+
+def store():
+    path = DB.parent / "config.json"
+    try:
+        config = json.loads(path.read_text())
+    except FileNotFoundError:
+        return LocalStore()
+    path.chmod(0o600)
+    if config["store"] == "local":
+        return LocalStore()
+    if config["store"] != "sheet":
+        raise ValueError("unknown store")
+    return SheetStore(config["url"], config["token"])
+
+
+def notify_due(backend=None):
+    backend = backend if backend is not None else store()
+    s = backend.load()
+    before = {x["id"]: (list(x["sent"]), x["sent_for"]) for k in KINDS for x in s[k]}
+    check(s, now())
+    for kind in KINDS:
+        for task in s[kind]:
+            if before[task["id"]] != (task["sent"], task["sent_for"]):
+                backend.update(task["id"], {k: task[k] for k in ("sent", "sent_for")})
 
 
 # ---------- spawn ----------
@@ -719,7 +861,7 @@ def find(s, rows, cur, q):
             return n
 
 
-def tui(scr):
+def tui(scr, backend=None):
     curses.curs_set(0)
     curses.set_escdelay(25)
     curses.use_default_colors()
@@ -728,17 +870,46 @@ def tui(scr):
         curses.init_pair(n, color, -1)
     scr.timeout(1000)  # tick every second: clock, due colors, midnight rollover
     cur, msg, query = 0, None, ""
+    backend = backend if backend is not None else store()
+    s = {"last_reset": now().date().isoformat(), **{k: [] for k in KINDS}}
+    refreshed, ch, offline = float("-inf"), -1, False
+
+    def write(op, *args):
+        nonlocal s, refreshed, msg, offline
+        try:
+            s = getattr(backend, op)(*args)
+        except (OSError, ValueError, RuntimeError) as e:
+            log.error("store %s: %s", op, e)
+            msg = "✗ task gone" if str(e) == "task gone" else "✗ offline"
+            offline = msg == "✗ offline"
+            return False
+        refreshed, offline = time.monotonic(), False
+        return True
+
     while True:
-        s = load()
+        if isinstance(backend, LocalStore) or (ch == -1 and time.monotonic() - refreshed >= 30):
+            try:
+                s = backend.load()
+                offline = False
+                if msg == "✗ offline":
+                    msg = None
+            except (OSError, ValueError, RuntimeError) as e:
+                log.error("store load: %s", e)
+                msg, offline = "✗ offline", True
+            refreshed = time.monotonic()
         rows = [(k, i) for k in KINDS for i in range(len(s[k]))]
         cur = max(0, min(cur, len(rows) - 1))
-        ys = draw(scr, s, cur, now(), msg)
+        status = msg or ("✗ offline" if offline else
+                         f"✗ {backend.bad_rows} bad rows in sheet" if backend.bad_rows else None)
+        ys = draw(scr, s, cur, now(), status)
         ch = scr.getch()
         if ch not in (-1, curses.KEY_RESIZE):
             msg = None
-        # every write reloads first so it doesn't clobber what the notifier just saved
         if ch == ord("q"):
             return
+        if offline and ch in map(ord, "arwxed \n"):
+            msg = "✗ offline"
+            continue
         if ch in (ord("j"), curses.KEY_DOWN):
             cur += 1
         elif ch in (ord("k"), curses.KEY_UP):
@@ -770,42 +941,36 @@ def tui(scr):
             kind = {ord("a"): "todo", ord("r"): "daily", ord("w"): "weekly"}[ch]
             got = ask_task(scr, kind)
             if got:
-                s = load()
-                s[kind].append({"title": got[0], "due": got[1], "done": False, "sent": fresh_sent(kind, got[1], now())})
-                save(s)
-                log.info("added %s: %s (due %s)", kind, *got)
-                cur = sum(len(s[k]) for k in KINDS[:KINDS.index(kind) + 1]) - 1
+                task = {"id": new_id(), "title": got[0], "due": got[1], "done": False,
+                        "sent": fresh_sent(kind, got[1], now()), "sent_for": got[1]}
+                if write("add", kind, task):
+                    log.info("added %s: %s (due %s)", kind, *got)
+                    cur = sum(len(s[k]) for k in KINDS[:KINDS.index(kind) + 1]) - 1
         elif rows:
             kind, i = rows[cur]
             task = s[kind][i]
             if ch in (ord(" "), ord("x"), 10):
-                s = reload(s)
-                if s:
-                    task = s[kind][i]
-                    task["done"] = not task["done"]
-                    if task["done"]:
-                        task["done_on"] = f"{now():%Y-%m-%d %H:%M}"
-                    save(s)
-                    log.info("%s: %s", "done" if task["done"] else "undone", task["title"])
-                    if task["done"]:
+                fields = {"done": not task["done"]}
+                if fields["done"]:
+                    fields["done_on"] = f"{now():%Y-%m-%d %H:%M}"
+                if write("update", task["id"], fields):
+                    log.info("%s: %s", "done" if fields["done"] else "undone", task["title"])
+                    i = next((n for n, x in enumerate(s[kind]) if x["id"] == task["id"]), None)
+                    if fields["done"] and i is not None:
                         celebrate(scr, s, cur, kind, i, ys[cur])
             elif ch == ord("c"):
                 msg = spawn(scr, s, cur, task)
             elif ch == ord("e"):
                 got = ask_task(scr, kind, task)
-                s = reload(s) if got else None
-                if s:
-                    task = s[kind][i]
-                    if got[1] != task["due"]:
-                        task["sent"] = fresh_sent(kind, got[1], now())
-                    task["title"], task["due"] = got
-                    save(s)
-                    log.info("edited %s: %s (due %s)", kind, *got)
+                if got:
+                    fields = {"title": got[0], "due": got[1], "sent_for": got[1]}
+                    if got[1] != task["due"] or task.get("sent_for") != got[1]:
+                        fields["sent"] = fresh_sent(kind, got[1], now())
+                    if write("update", task["id"], fields):
+                        log.info("edited %s: %s (due %s)", kind, *got)
             elif ch == ord("d"):
-                s = reload(s) if confirm(scr, f"delete '{plain(task['title'])}'? y/n") else None
-                if s:
-                    log.info("deleted %s: %s", kind, s[kind].pop(i)["title"])
-                    save(s)
+                if confirm(scr, f"delete '{plain(task['title'])}'? y/n") and write("delete", task["id"]):
+                    log.info("deleted %s: %s", kind, task["title"])
             elif ch == ord("o"):
                 m = URL.search(task["title"])
                 if m:
@@ -817,9 +982,7 @@ if __name__ == "__main__":
     logging.basicConfig(filename=DB.parent / "todoit.log", level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     if sys.argv[1:] == ["notify"]:
-        state = load()
-        check(state, now())
-        save(state)
+        notify_due()
     else:
         locale.setlocale(locale.LC_ALL, "")
         try:

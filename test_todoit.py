@@ -18,7 +18,7 @@ def at(day, hh, mm):
 
 
 def task(title, due, done=False, sent=None, done_on=None):
-    t = {"title": title, "due": due, "done": done, "sent": sent or []}
+    t = {"id": todoit.new_id(), "title": title, "due": due, "done": done, "sent": sent or [], "sent_for": due}
     if done_on is not None:
         t["done_on"] = done_on
     return t
@@ -517,10 +517,10 @@ class Navigation(unittest.TestCase):
             with self.subTest(start=start, answers=answers), \
                     mock.patch.multiple(todoit.curses, curs_set=mock.DEFAULT, set_escdelay=mock.DEFAULT,
                                         use_default_colors=mock.DEFAULT, init_pair=mock.DEFAULT), \
-                    mock.patch.object(todoit, "load", return_value=s), \
+                    mock.patch.object(todoit.LocalStore, "load", return_value=s), \
                     mock.patch.object(todoit, "now", return_value=at(28, 10, 0)), \
                     mock.patch.object(todoit, "prompt", side_effect=prompt), mock.patch.object(todoit, "draw") as draw:
-                todoit.tui(scr)
+                todoit.tui(scr, todoit.LocalStore())
             self.assertEqual([(c.args[2], c.args[4] if len(c.args) > 4 else None) for c in draw.call_args_list], want)
             self.assertTrue(all(c.args[:2] == (scr, s) and c.args[3] == at(28, 10, 0) for c in draw.call_args_list))
 
@@ -529,11 +529,12 @@ class Store(unittest.TestCase):
     def test_first_run_then_round_trip(self):
         with TemporaryDirectory() as d, mock.patch.object(todoit, "DB", Path(d) / "new" / "tasks.json"), \
                 mock.patch.object(todoit, "now", return_value=at(28, 10, 0)):
-            s = todoit.load()
+            backend = todoit.LocalStore()
+            s = backend.load()
             self.assertEqual(s, state())
             s["todo"].append(task("neon order form", "2026-09-29 17:00"))
             todoit.save(s)
-            self.assertEqual(todoit.load(), s)
+            self.assertEqual(backend.load(), s)
             self.assertEqual(list(todoit.DB.parent.glob("*.tmp")), [])
 
     def test_load_legacy_store_without_weekly(self):
@@ -542,17 +543,244 @@ class Store(unittest.TestCase):
             old = state(last_reset="2026-09-27")
             old.pop("weekly")
             todoit.save(old)
-            self.assertEqual(todoit.load()["weekly"], [])
+            self.assertEqual(todoit.LocalStore().load()["weekly"], [])
 
-    def test_reload_refuses_write_after_midnight_reshuffle(self):
+    def test_write_to_purged_id_is_task_gone(self):
         with TemporaryDirectory() as d, mock.patch.object(todoit, "DB", Path(d) / "tasks.json"), \
                 mock.patch.object(todoit, "notify"), mock.patch.object(todoit, "now") as now:
             todoit.save(state(todo=[task("A", "2026-09-30 17:00", done=True), task("B", "2026-09-30 17:00")]))
             now.return_value = at(28, 23, 59)
-            drawn = todoit.load()
-            self.assertIsNotNone(todoit.reload(drawn))  # same day: safe to write by index
+            backend = todoit.LocalStore()
+            drawn = backend.load()
             now.return_value = at(29, 0, 5)
-            self.assertIsNone(todoit.reload(drawn))  # rollover purged A, so index 1 no longer means B
+            with self.assertRaisesRegex(RuntimeError, "task gone"):
+                backend.update(drawn["todo"][0]["id"], {"title": "wrong"})
+            s = backend.update(drawn["todo"][1]["id"], {"title": "right"})
+            self.assertEqual([x["title"] for x in s["todo"]], ["right"])
+            with self.assertRaisesRegex(RuntimeError, "task gone"):
+                backend.delete(drawn["todo"][0]["id"])
+
+    def test_backfills_legacy_ids_and_sent_for_silently(self):
+        with TemporaryDirectory() as d, mock.patch.object(todoit, "DB", Path(d) / "tasks.json"), \
+                mock.patch.object(todoit, "now", return_value=at(28, 18, 0)), mock.patch.object(todoit, "notify") as notify:
+            old = task("legacy", "17:00", sent=["soon"])
+            old.pop("id")
+            old.pop("sent_for")
+            todoit.save(state(daily=[old]))
+            backend = todoit.LocalStore()
+            s = backend.load()
+            row = s["daily"][0]
+            self.assertRegex(row["id"], r"^t[0-9a-f]{8}$")
+            self.assertEqual((row["sent"], row["sent_for"]), (["soon"], "17:00"))
+            self.assertEqual(backend.load(), s)
+            self.assertEqual(json.loads(todoit.DB.read_text()), s)
+            notify.assert_not_called()
+
+    def test_add_update_delete_preserve_order_and_bad_rows(self):
+        with TemporaryDirectory() as d, mock.patch.object(todoit, "DB", Path(d) / "tasks.json"), \
+                mock.patch.object(todoit, "now", return_value=at(28, 10, 0)):
+            a, b = task("A", "17:00"), task("B", "18:00")
+            bad = task("bad", "someday")
+            todoit.save(state(daily=[a, bad]))
+            backend = todoit.LocalStore()
+            s = backend.add("daily", b)
+            self.assertEqual([x["id"] for x in s["daily"]], [a["id"], b["id"]])
+            self.assertEqual(backend.add("daily", b), s)
+            s = backend.update(a["id"], {"sent": ["soon"]})
+            self.assertEqual(s["daily"][0]["title"], "A")
+            self.assertEqual(backend.delete(a["id"])["daily"], [b])
+            self.assertEqual(backend.bad_rows, 1)
+            self.assertEqual(json.loads(todoit.DB.read_text())["daily"], [bad, b])
+
+    def test_factory_reads_config_at_call_time(self):
+        with TemporaryDirectory() as d, mock.patch.object(todoit, "DB", Path(d) / "tasks.json"):
+            self.assertIsInstance(todoit.store(), todoit.LocalStore)
+            config = todoit.DB.parent / "config.json"
+            config.write_text(json.dumps({"store": "sheet", "url": "https://sheet.invalid/exec", "token": "secret"}))
+            backend = todoit.store()
+            self.assertIsInstance(backend, todoit.SheetStore)
+            self.assertEqual((backend.url, backend.token), ("https://sheet.invalid/exec", "secret"))
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            config.write_text('{"store": "local"}')
+            self.assertIsInstance(todoit.store(), todoit.LocalStore)
+
+
+class Normalise(unittest.TestCase):
+    def test_phone_dues_and_checkboxes(self):
+        s = state(daily=[task("a", "9:00", done="TRUE"), task("b", "17:00", done="FALSE")],
+                  weekly=[task("c", "Fri"), task("d", "Fri 17:00")])
+        clean, bad = todoit.normalise(s, at(28, 10, 0))
+        self.assertEqual(bad, 0)
+        self.assertEqual([x["due"] for x in clean["daily"]], ["09:00", "17:00"])
+        self.assertEqual([x["done"] for x in clean["daily"]], [True, False])
+        self.assertEqual([x["due"] for x in clean["weekly"]], ["fri 17:00"] * 2)
+
+    def test_bad_rows_are_skipped_before_due_and_label_can_crash(self):
+        rows = [task("relative", "tomorrow"), task("short", "2026-09-28 9:00"),
+                task("date", "2026-02-30 17:00"), task("stamp", "2026-09-28 17:00", done_on="broken"),
+                {**task("null stamp", "2026-09-28 17:00", done=True), "done_on": None},
+                task("old stamp", "2026-09-28 17:00", done_on="2026-09-28"),
+                task("new stamp", "2026-09-28 17:00", done_on="2026-09-28 12:00")]
+        clean, bad = todoit.normalise(state(todo=rows, weekly=[task("bad", "notaday 17:00")]), at(28, 10, 0))
+        self.assertEqual(bad, 6)
+        self.assertEqual([x["title"] for x in clean["todo"]], ["old stamp", "new stamp"])
+        self.assertEqual(clean["weekly"], [])
+
+
+class SheetStore(unittest.TestCase):
+    def setUp(self):
+        self.backend = todoit.SheetStore("https://sheet.invalid/exec", "secret")
+        self.row = task("a", "17:00")
+        self.s = state(daily=[self.row])
+        self.response = mock.MagicMock()
+        self.response.__enter__.return_value = self.response
+        self.response.read.return_value = json.dumps({"ok": True, "state": self.s, "missed": []}).encode()
+        self.urlopen = mock.patch.object(todoit, "urlopen", return_value=self.response).start()
+        mock.patch.object(todoit, "now", return_value=at(28, 10, 0)).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_ops_post_json_with_timeout_and_return_state(self):
+        calls = [("load", lambda: self.backend.load(), {}),
+                 ("add", lambda: self.backend.add("daily", self.row), {"kind": "daily", "task": self.row}),
+                 ("update", lambda: self.backend.update(self.row["id"], {"sent": ["soon"]}),
+                  {"id": self.row["id"], "fields": {"sent": ["soon"]}}),
+                 ("delete", lambda: self.backend.delete(self.row["id"]), {"id": self.row["id"]})]
+        for op, call, fields in calls:
+            with self.subTest(op=op):
+                self.assertEqual(call(), self.s)
+                req = self.urlopen.call_args.args[0]
+                self.assertEqual(req.full_url, self.backend.url)
+                self.assertEqual(req.get_method(), "POST")
+                self.assertEqual(req.get_header("Content-type"), "application/json")
+                self.assertEqual(json.loads(req.data), {"token": "secret", "op": op, **fields})
+                self.assertEqual(self.urlopen.call_args.kwargs, {"timeout": 10})
+        self.assertEqual(self.urlopen.call_count, 4)  # writes don't fetch again
+
+    def test_html_and_missing_ok_are_clear_errors(self):
+        for body, error in [(b"<html>login</html>", "non-JSON"), (b"{}", "ok field"),
+                            (b'[]', "ok field"), (b'{"ok": true}', "bad sheet state"),
+                            (b'{"ok": false, "error": "bad token"}', "bad token"),
+                            (b'{"ok": false, "error": "task gone"}', "task gone")]:
+            with self.subTest(body=body):
+                self.response.read.return_value = body
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self.backend.load()
+
+    def test_timeout(self):
+        self.urlopen.side_effect = TimeoutError("timed out")
+        with self.assertRaises(TimeoutError):
+            self.backend.load()
+
+    def test_missed_banners_and_unknown_kind_count(self):
+        self.response.read.return_value = json.dumps({"ok": True, "state": {**self.s, "bad_rows": 1},
+            "missed": [{"kind": "daily", "title": "[late](https://x.invalid)", "due": "23:59"},
+                       {"kind": "weekly", "title": "weekly", "due": "sun 23:59"}]}).encode()
+        with mock.patch.object(todoit, "notify") as notify:
+            self.backend.load()
+        self.assertEqual(self.backend.bad_rows, 1)
+        self.assertEqual(notify.call_args_list, [mock.call("❌ missed · was due 23:59", "late", "Basso"),
+                                                mock.call("❌ missed · was due Sun 23:59", "weekly", "Basso")])
+
+
+class SentFor(unittest.TestCase):
+    def test_due_edits_rearm_or_quiet_before_checks(self):
+        cases = [("daily", "17:00", "18:00", at(28, 17, 40), ["soon"], 1),
+                 ("daily", "18:00", "17:00", at(28, 17, 40), ["soon", "missed"], 0),
+                 ("weekly", "fri 17:00", "mon 17:00", at(28, 17, 40), ["soon", "missed"], 0),
+                 ("weekly", "mon 17:00", "mon 18:00", at(28, 17, 40), ["soon"], 1),
+                 ("todo", "2026-09-29 17:00", "2026-09-28 17:00", at(28, 17, 40), ["missed"], 1),
+                 ("daily", "17:00", "20:00", at(28, 17, 40), [], 0),
+                 ("daily", "", "17:00", at(28, 17, 40), ["soon", "missed"], 0)]
+        for kind, old, due, t, sent, count in cases:
+            row = {**task("a", due, sent=["soon", "missed"]), "sent_for": old}
+            s = state(**{kind: [row]})
+            with self.subTest(kind=kind, due=due), mock.patch.object(todoit, "notify") as notify:
+                todoit.check(s, t)
+                self.assertEqual(row["sent"], sent)
+                self.assertEqual(row["sent_for"], due)
+                self.assertEqual(notify.call_count, count)
+                todoit.check(s, t)
+                self.assertEqual(notify.call_count, count)
+
+    def test_notifier_updates_only_changed_reminder_fields(self):
+        changed = task("due", "17:00")
+        quiet = task("later", "20:00")
+        backend = mock.Mock(**{"load.return_value": state(daily=[changed, quiet])})
+        with mock.patch.object(todoit, "now", return_value=at(28, 16, 40)), mock.patch.object(todoit, "notify"):
+            todoit.notify_due(backend)
+        backend.load.assert_called_once()
+        backend.update.assert_called_once_with(changed["id"], {"sent": ["soon"], "sent_for": "17:00"})
+
+
+class SyncTui(unittest.TestCase):
+    def run_tui(self, backend, keys, ticks=None, **patches):
+        scr = mock.Mock(**{"getch.side_effect": keys})
+        with mock.patch.multiple(todoit.curses, curs_set=mock.DEFAULT, set_escdelay=mock.DEFAULT,
+                                 use_default_colors=mock.DEFAULT, init_pair=mock.DEFAULT), \
+                mock.patch.object(todoit, "now", return_value=at(28, 10, 0)), \
+                mock.patch.object(todoit.time, "monotonic", **({"side_effect": ticks} if ticks else {"return_value": 0})), \
+                mock.patch.multiple(todoit, **{"celebrate": mock.DEFAULT, **patches}), \
+                mock.patch.object(todoit, "draw", return_value=[4, 5]) as draw:
+            todoit.tui(scr, backend)
+        return draw
+
+    def test_sheet_navigation_does_not_load_and_idle_refreshes_after_30s(self):
+        backend = todoit.SheetStore("https://sheet.invalid/exec", "secret")
+        with mock.patch.object(backend, "load", return_value=state()) as load:
+            self.run_tui(backend, [ord("j"), ord("k"), -1, -1, ord("q")], ticks=[0, 0, 29, 30, 30])
+        self.assertEqual(load.call_count, 2)
+
+    def test_local_reloads_every_pass(self):
+        backend = todoit.LocalStore()
+        with mock.patch.object(backend, "load", return_value=state()) as load:
+            self.run_tui(backend, list(map(ord, "jkq")))
+        self.assertEqual(load.call_count, 3)
+
+    def test_offline_keeps_snapshot_and_blocks_write(self):
+        backend = todoit.SheetStore("https://sheet.invalid/exec", "secret")
+        s = state(daily=[task("a", "17:00")])
+        with mock.patch.object(backend, "load", side_effect=[s, TimeoutError("offline")]) as load, \
+                mock.patch.object(backend, "update") as update, self.assertLogs("todoit", "ERROR"):
+            draw = self.run_tui(backend, [-1, ord("x"), ord("q")], ticks=[0, 0, 31, 31])
+        self.assertEqual(load.call_count, 2)
+        update.assert_not_called()
+        self.assertEqual(draw.call_args.args[1], s)
+        self.assertEqual(draw.call_args.args[4], "✗ offline")
+
+    def test_write_failure_and_bad_row_status(self):
+        for error, status in [(RuntimeError("task gone"), "✗ task gone"), (TimeoutError(), "✗ offline")]:
+            backend = mock.Mock(bad_rows=2, **{"load.return_value": state(daily=[task("a", "17:00")]),
+                                              "update.side_effect": error})
+            with self.subTest(status=status), self.assertLogs("todoit", "ERROR"):
+                draw = self.run_tui(backend, list(map(ord, "xq")))
+                self.assertEqual(draw.call_args_list[0].args[4], "✗ 2 bad rows in sheet")
+                self.assertEqual(draw.call_args.args[4], status)
+
+    def test_writes_use_ids_and_returned_state_without_fetch(self):
+        row = task("a", "17:00")
+        done = {**row, "done": True, "done_on": "2026-09-28 10:00"}
+        s = state(daily=[row])
+        updated = state(daily=[done])
+        backend = mock.Mock(bad_rows=0, **{"load.return_value": s, "update.return_value": updated})
+        draw = self.run_tui(backend, list(map(ord, "xq")), celebrate=mock.DEFAULT)
+        backend.load.assert_called_once()
+        backend.update.assert_called_once_with(row["id"], {"done": True, "done_on": "2026-09-28 10:00"})
+        self.assertEqual(draw.call_args.args[1], updated)
+
+    def test_add_edit_delete_set_reminder_fields(self):
+        row = task("a", "17:00")
+        s = state(daily=[row])
+        backend = mock.Mock(bad_rows=0, **{"load.return_value": s, "add.return_value": s,
+                                          "update.return_value": s, "delete.return_value": state()})
+        self.run_tui(backend, list(map(ord, "redq")), ask_task=mock.Mock(side_effect=[("a", "17:00"), ("b", "18:00")]),
+                     confirm=mock.Mock(return_value=True))
+        kind, added = backend.add.call_args.args
+        self.assertEqual(kind, "daily")
+        self.assertRegex(added["id"], r"^t[0-9a-f]{8}$")
+        self.assertEqual((added["sent"], added["sent_for"]), ([], "17:00"))
+        backend.update.assert_called_once_with(row["id"], {"title": "b", "due": "18:00", "sent": [], "sent_for": "18:00"})
+        backend.delete.assert_called_once_with(row["id"])
+        backend.load.assert_called_once()
 
 
 class Spawn(unittest.TestCase):
