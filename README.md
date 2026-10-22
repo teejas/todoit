@@ -11,6 +11,8 @@ make uninstall  # stop banners, remove symlink (keeps ~/.todoit/tasks.json)
 
 **Keys:** `space`/`x` done · `a` add todo · `r` add daily · `w` add weekly · `e` edit · `d` delete · `o` open link · `c` spawn agent · `j`/`k` move · `⇧↑`/`⇧↓` section jump · `/` search jumps as you type (Enter keeps the spot) · `n` next match · `q` quit · in text fields: `←`/`→` and `⌥←`/`⌥→` move the cursor · `esc` clear · `esc esc` cancel · `⌥⌫` delete word · adding/editing a task: `esc` on an empty title cancels, on an empty due goes back to the title
 
+Each section shows undone tasks by due time, then done tasks by due time; the list scrolls with the cursor.
+
 **Due formats:** daily `HH:MM`. Weekly `DAY [HH:MM]` (default 17:00). Todo `today|tomorrow|+N|fri|MM-DD|YYYY-MM-DD` plus optional `HH:MM` (default 17:00).
 
 **Banners:** `⏰` 30 min before due, `❌` once it's past due. Each fires once per task; dailies re-arm at midnight, weeklies on Monday, editing a due time re-arms it.

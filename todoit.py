@@ -105,6 +105,11 @@ def due_at(kind, task, today):
     return datetime.strptime(task["due"], "%Y-%m-%d %H:%M")
 
 
+def order(s, t):
+    return [(kind, i) for kind in KINDS
+            for i in sorted(range(len(s[kind])), key=lambda i: (s[kind][i]["done"], due_at(kind, s[kind][i], t.date())))]
+
+
 def fresh_sent(kind, due, t):
     """`sent` for a new due. Daily/weekly slots already past stay quiet until the next reset."""
     return ["soon", "missed"] if kind != "todo" and t >= due_at(kind, {"due": due}, t.date()) else []
@@ -334,8 +339,15 @@ def shimmer(scr, s, f):
             put(scr, 1, BAR_X + x, "━", curses.A_BOLD if x == head else C(YELLOW) | curses.A_BOLD)
 
 
-def draw(scr, s, cur, t, status=None):
+def scroll_top(cy, total, room):
+    # ponytail: centered, no stored offset; minimal-scroll needs state
+    return max(0, min(cy - room // 2, total - room))
+
+
+def draw(scr, s, cur, t, status=None, rows=None):
     """Render the list; returns the screen row of each task, in cursor order."""
+    if rows is None:
+        rows = order(s, t)
     scr.erase()
     h, w = scr.getmaxyx()
     put(scr, 0, 1, "todoit", C(MAGENTA) | curses.A_BOLD)
@@ -349,31 +361,36 @@ def draw(scr, s, cur, t, status=None):
     put(scr, 1, BAR_X + bar + 1, f"{done}/{total} today", curses.A_BOLD)
     stats = f"{today} due today · {overdue} overdue"
     put(scr, 1, w - len(stats) - 1, stats, C(RED) | curses.A_BOLD if overdue else curses.A_DIM)
-    y, ys = 3, []
-    # ponytail: no scrolling; add it when the list outgrows the terminal
+    pad = curses.newpad(max(h, sum(len(s[k]) + 3 for k in KINDS)), w)
+    y, ys = 0, []
     for kind in KINDS:
         tasks = s[kind]
-        put(scr, y, 1, "─" * (w - 2), C(CYAN) | curses.A_DIM)
-        put(scr, y, 2, f" {kind.upper()} {sum(x['done'] for x in tasks)}/{len(tasks)} ", C(CYAN) | curses.A_BOLD)
+        put(pad, y, 1, "─" * (w - 2), C(CYAN) | curses.A_DIM)
+        put(pad, y, 2, f" {kind.upper()} {sum(x['done'] for x in tasks)}/{len(tasks)} ", C(CYAN) | curses.A_BOLD)
         note = {"daily": " resets at midnight ", "weekly": " resets mondays "}.get(kind)
         if note:
-            put(scr, y, w - len(note) - 1, note, C(CYAN) | curses.A_DIM)
+            put(pad, y, w - len(note) - 1, note, C(CYAN) | curses.A_DIM)
         y += 1
         if not tasks:
-            put(scr, y, 4, f"nothing here, press {dict(daily='r', weekly='w', todo='a')[kind]} to add", curses.A_DIM)
+            put(pad, y, 4, f"nothing here, press {dict(daily='r', weekly='w', todo='a')[kind]} to add", curses.A_DIM)
             y += 1
-        for task in tasks:
+        for task in (tasks[i] for k, i in rows if k == kind):
             sel = len(ys) == cur
             lab, lab_attr = label(kind, task, t)
             title = plain(task["title"]) + (" ↗" if URL.search(task["title"]) else "")
-            put(scr, y, 1, "▸" if sel else " ", C(MAGENTA) | curses.A_BOLD)
-            put(scr, y, 3, "[✓]" if task["done"] else "[ ]", C(GREEN) | curses.A_BOLD if task["done"] else 0)
-            put(scr, y, 7, fit(title, max(0, w - len(lab) - 10)),
+            put(pad, y, 1, "▸" if sel else " ", C(MAGENTA) | curses.A_BOLD)
+            put(pad, y, 3, "[✓]" if task["done"] else "[ ]", C(GREEN) | curses.A_BOLD if task["done"] else 0)
+            put(pad, y, 7, fit(title, max(0, w - len(lab) - 10)),
                 (curses.A_DIM if task["done"] else 0) | (curses.A_BOLD if sel else 0))
-            put(scr, y, w - len(lab) - 2, lab, lab_attr)
+            put(pad, y, w - len(lab) - 2, lab, lab_attr)
             ys.append(y)
             y += 1
         y += 1
+    room = h - 4
+    if room > 0:
+        top = scroll_top(ys[cur] if ys else 0, y, room)
+        pad.overwrite(scr, top, 0, 3, 0, h - 2, w - 1)
+        ys = [3 + v - top for v in ys]
     put(scr, h - 1, 1, status or HELP, curses.A_BOLD if status else curses.A_DIM)
     return ys
 
@@ -526,13 +543,13 @@ def step(scr, ps):
     ps[:] = alive
 
 
-def play(scr, s, cur, frames, fx):
+def play(scr, s, cur, frames, fx, rows):
     """~30fps animation over the list. fx(frame, particles) spawns and overlays. Any key skips."""
     ps = []
     scr.timeout(33)
     try:
         for f in range(frames):
-            draw(scr, s, cur, now())
+            draw(scr, s, cur, now(), rows=rows)
             step(scr, ps)
             shimmer(scr, s, f)
             fx(f, ps)
@@ -542,7 +559,7 @@ def play(scr, s, cur, frames, fx):
         scr.timeout(1000)
 
 
-def celebrate(scr, s, cur, kind, i, y):
+def celebrate(scr, s, cur, kind, i, y, rows):
     h, w = scr.getmaxyx()
     if all(x["done"] for x in s[kind]):
         text = {"daily": " ✦ ALL DAILIES DONE ✦ ", "weekly": " ✦ ALL WEEKLIES DONE ✦ ",
@@ -552,7 +569,7 @@ def celebrate(scr, s, cur, kind, i, y):
             if f % 8 == 0 and f < 64:
                 ps.append(rocket(w, h))
             put(scr, h // 2, (w - len(text)) // 2, text, C(1 + f // 3 % 6) | curses.A_BOLD | curses.A_REVERSE)
-        play(scr, s, cur, 120, fx)
+        play(scr, s, cur, 120, fx, rows)
     else:
         title, cheer = plain(s[kind][i]["title"]), random.choice(CHEERS)
 
@@ -561,7 +578,7 @@ def celebrate(scr, s, cur, kind, i, y):
                 ps.extend(burst(7 + min(len(title), w - 8) // 2, y, 60, 1.2, up=0.4))  # out of the title
             put(scr, y, 7, title[:3 * f], C(GREEN) | curses.A_BOLD)  # green sweep across the title
             put(scr, y, 9 + len(title), cheer[:f], C(MAGENTA) | curses.A_BOLD)  # typed-out cheer
-        play(scr, s, cur, 45, fx)
+        play(scr, s, cur, 45, fx, rows)
 
 
 def draw_panel(scr, s, cur, title, lines, focus=0):
@@ -704,7 +721,7 @@ def spawn(scr, s, cur, task):
 
 def section_start(rows, cur, down):
     """Next section's start going down; current/previous start going up."""
-    starts = [n for n, (_, i) in enumerate(rows) if i == 0]
+    starts = [n for n, (kind, _) in enumerate(rows) if n == 0 or kind != rows[n - 1][0]]
     if down:
         return next((n for n in starts if n > cur), max(0, len(rows) - 1))
     return next((n for n in reversed(starts) if n < cur), 0)
@@ -730,9 +747,10 @@ def tui(scr):
     cur, msg, query = 0, None, ""
     while True:
         s = load()
-        rows = [(k, i) for k in KINDS for i in range(len(s[k]))]
+        t = now()
+        rows = order(s, t)
         cur = max(0, min(cur, len(rows) - 1))
-        ys = draw(scr, s, cur, now(), msg)
+        ys = draw(scr, s, cur, t, msg, rows)
         ch = scr.getch()
         if ch not in (-1, curses.KEY_RESIZE):
             msg = None
@@ -774,7 +792,7 @@ def tui(scr):
                 s[kind].append({"title": got[0], "due": got[1], "done": False, "sent": fresh_sent(kind, got[1], now())})
                 save(s)
                 log.info("added %s: %s (due %s)", kind, *got)
-                cur = sum(len(s[k]) for k in KINDS[:KINDS.index(kind) + 1]) - 1
+                cur = order(s, now()).index((kind, len(s[kind]) - 1))
         elif rows:
             kind, i = rows[cur]
             task = s[kind][i]
@@ -788,7 +806,7 @@ def tui(scr):
                     save(s)
                     log.info("%s: %s", "done" if task["done"] else "undone", task["title"])
                     if task["done"]:
-                        celebrate(scr, s, cur, kind, i, ys[cur])
+                        celebrate(scr, s, cur, kind, i, ys[cur], rows)
             elif ch == ord("c"):
                 msg = spawn(scr, s, cur, task)
             elif ch == ord("e"):
@@ -800,6 +818,7 @@ def tui(scr):
                         task["sent"] = fresh_sent(kind, got[1], now())
                     task["title"], task["due"] = got
                     save(s)
+                    cur = order(s, now()).index((kind, i))
                     log.info("edited %s: %s (due %s)", kind, *got)
             elif ch == ord("d"):
                 s = reload(s) if confirm(scr, f"delete '{plain(task['title'])}'? y/n") else None

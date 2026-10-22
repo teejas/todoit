@@ -410,14 +410,66 @@ class Display(unittest.TestCase):
 
     def test_draw_weekly_section_and_empty_hint(self):
         scr = mock.Mock(**{"getmaxyx.return_value": (20, 90)})
-        with mock.patch.object(todoit, "put") as put:
+        with mock.patch.object(todoit, "put") as put, mock.patch.object(todoit.curses, "newpad") as newpad:
             todoit.draw(scr, state(), 0, at(28, 16, 0))
+        newpad.assert_called_once_with(20, 90)
+        newpad.return_value.overwrite.assert_called_once_with(scr, 0, 0, 3, 0, 18, 89)
         calls = [c.args for c in put.call_args_list]
         self.assertIn("0/0 today", [c[3] for c in calls])
         self.assertIn(" WEEKLY 0/0 ", [c[3] for c in calls])
         self.assertIn("nothing here, press w to add", [c[3] for c in calls])
         note = " resets mondays "
         self.assertTrue(any(c[2:4] == (90 - len(note) - 1, note) for c in calls))
+
+    def test_draw_scrolls_with_cursor(self):
+        s = state(daily=[task("daily", "09:00")], weekly=[task("weekly", "mon 09:00")],
+                  todo=[task(str(i), "2026-09-30 17:00") for i in range(30)])
+        for h, cur, top in [(12, 0, 0), (12, 31, 30), (80, 31, 0)]:
+            scr = mock.Mock(**{"getmaxyx.return_value": (h, 90)})
+            with self.subTest(h=h, cur=cur), mock.patch.object(todoit, "put") as put, \
+                    mock.patch.object(todoit.curses, "newpad") as newpad:
+                events = mock.Mock()
+                events.attach_mock(put, "put")
+                events.attach_mock(newpad.return_value.overwrite, "overwrite")
+                ys = todoit.draw(scr, s, cur, at(28, 16, 0), "saved")
+                newpad.assert_called_once_with(max(h, 41), 90)
+                newpad.return_value.overwrite.assert_called_once_with(scr, top, 0, 3, 0, h - 2, 89)
+                self.assertEqual(len(ys), 32)
+                self.assertTrue(3 <= ys[cur] <= h - 2)
+                self.assertEqual(events.mock_calls[-2:], [
+                    mock.call.overwrite(scr, top, 0, 3, 0, h - 2, 89),
+                    mock.call.put(scr, h - 1, 1, "saved", todoit.curses.A_BOLD)])
+
+    def test_draw_uses_display_order_or_supplied_rows(self):
+        s = state(daily=[task("done", "08:00", done=True), task("late", "17:00"), task("early", "09:00")])
+        rows = [("daily", 2), ("daily", 1), ("daily", 0)]
+        for supplied, titles in [(None, ["early", "late", "done"]), (rows[::-1], ["done", "late", "early"])]:
+            scr = mock.Mock(**{"getmaxyx.return_value": (24, 90)})
+            with self.subTest(supplied=supplied), mock.patch.object(todoit, "put") as put, \
+                    mock.patch.object(todoit.curses, "newpad") as newpad:
+                ys = todoit.draw(scr, s, 1, at(28, 16, 0), rows=supplied)
+            calls = [c.args for c in put.call_args_list if c.args[0] is newpad.return_value]
+            self.assertEqual([c[3] for c in calls if c[2] == 7], titles)
+            self.assertEqual(ys, [4, 5, 6])
+            self.assertTrue(any(c[1:4] == (2, 1, "▸") for c in calls))
+
+    def test_draw_tiny_terminal_skips_overwrite(self):
+        for h in (1, 4):
+            scr = mock.Mock(**{"getmaxyx.return_value": (h, 10)})
+            with self.subTest(h=h), mock.patch.object(todoit, "put"), \
+                    mock.patch.object(todoit.curses, "newpad") as newpad:
+                ys = todoit.draw(scr, state(daily=[task("a", "09:00")]), 0, at(28, 16, 0))
+            newpad.return_value.overwrite.assert_not_called()
+            self.assertEqual(ys, [1])
+
+    def test_play_keeps_supplied_rows(self):
+        scr, fx = mock.Mock(**{"getch.return_value": -1}), mock.Mock()
+        s = state(daily=[task("late", "17:00"), task("early", "09:00", done=True)])
+        rows, t = [("daily", 1), ("daily", 0)], at(28, 16, 0)
+        with mock.patch.object(todoit, "draw") as draw, mock.patch.object(todoit, "step"), \
+                mock.patch.object(todoit, "shimmer"), mock.patch.object(todoit, "now", return_value=t):
+            todoit.play(scr, s, 0, 2, fx, rows)
+        self.assertEqual(draw.call_args_list, [mock.call(scr, s, 0, t, rows=rows)] * 2)
 
     def test_momentum_splits_due_today_from_overdue(self):
         s = state(daily=[task("done", "09:00", done=True), task("missed", "12:00"), task("later", "18:00")],
@@ -472,11 +524,35 @@ class Display(unittest.TestCase):
 
 
 class Navigation(unittest.TestCase):
+    def test_order_keeps_storage_and_sorts_undone_then_done_by_due(self):
+        dues = {"daily": ["17:00", "09:00", "12:00"],
+                "weekly": ["fri 17:00", "mon 09:00", "wed 12:00"],
+                "todo": ["2026-10-01 09:00", "2026-09-29 17:00", "2026-09-30 12:00"]}
+        s = state(**{k: [task("done late", ds[0], done=True), task("late", ds[0]),
+                         task("done early", ds[1], done=True), task("early", ds[1]), task("middle", ds[2])]
+                     for k, ds in dues.items()})
+        stored = json.dumps(s)
+        self.assertEqual(todoit.order(s, at(30, 16, 0)),
+                         [(k, i) for k in todoit.KINDS for i in (3, 4, 1, 2, 0)])
+        self.assertEqual(json.dumps(s), stored)
+        self.assertEqual(todoit.order(state(), at(28, 16, 0)), [])
+
+    def test_order_equal_keys_keep_insertion_order(self):
+        s = state(daily=[task(str(i), "09:00", done=i in (0, 2)) for i in range(5)])
+        self.assertEqual(todoit.order(s, at(28, 16, 0)), [("daily", i) for i in (1, 3, 4, 0, 2)])
+
+    def test_scroll_top(self):
+        for cy, total, room, want in [(1, 100, 10, 0), (40, 100, 10, 35), (99, 100, 10, 90),
+                                      (2, 5, 10, 0), (0, 0, 10, 0)]:
+            self.assertEqual(todoit.scroll_top(cy, total, room), want)
+
     def test_section_start(self):
         rows = [("daily", 0), ("daily", 1), ("weekly", 0), ("todo", 0), ("todo", 1), ("todo", 2)]
         skip = rows[:2] + rows[3:]
+        sorted_ = [("daily", 1), ("daily", 0), ("daily", 2), ("weekly", 0)]
         for rs, down, want in [(rows, True, [2, 2, 3, 5, 5, 5]), (rows, False, [0, 0, 0, 2, 3, 3]),
                                (skip, True, [2, 2, 4, 4, 4]), (skip, False, [0, 0, 0, 2, 2]),
+                               (sorted_, True, [3, 3, 3, 3]), (sorted_, False, [0, 0, 0, 0]),
                                ([], True, [0]), ([], False, [0])]:
             for cur, n in enumerate(want):
                 self.assertEqual(todoit.section_start(rs, cur, down), n, (rs, cur, down))
@@ -523,6 +599,62 @@ class Navigation(unittest.TestCase):
                 todoit.tui(scr)
             self.assertEqual([(c.args[2], c.args[4] if len(c.args) > 4 else None) for c in draw.call_args_list], want)
             self.assertTrue(all(c.args[:2] == (scr, s) and c.args[3] == at(28, 10, 0) for c in draw.call_args_list))
+
+    def test_add_follows_new_task_in_display_order(self):
+        dues = {"daily": ("09:00", "17:00"), "weekly": ("mon 09:00", "fri 17:00"),
+                "todo": ("2026-09-29 09:00", "2026-09-30 17:00")}
+        for kind, key in [("daily", "r"), ("weekly", "w"), ("todo", "a")]:
+            s = state(**{k: [task("late", ds[1]), task("done", ds[0], done=True)] for k, ds in dues.items()})
+            scr = mock.Mock(**{"getch.side_effect": [ord(key), ord("q")]})
+            with self.subTest(kind=kind), \
+                    mock.patch.multiple(todoit.curses, curs_set=mock.DEFAULT, set_escdelay=mock.DEFAULT,
+                                        use_default_colors=mock.DEFAULT, init_pair=mock.DEFAULT), \
+                    mock.patch.object(todoit, "load", return_value=s), mock.patch.object(todoit, "save") as save, \
+                    mock.patch.object(todoit, "now", return_value=at(28, 10, 0)), \
+                    mock.patch.object(todoit, "ask_task", return_value=("new", dues[kind][0])), \
+                    mock.patch.object(todoit, "draw") as draw:
+                todoit.tui(scr)
+            cur = draw.call_args.args[2]
+            self.assertEqual(cur, 2 * todoit.KINDS.index(kind))
+            self.assertEqual(draw.call_args.args[5][cur], (kind, 2))
+            self.assertEqual([x["title"] for x in s[kind]], ["late", "done", "new"])
+            save.assert_called_once_with(s)
+
+    def test_edit_follows_task_by_storage_index(self):
+        s = state(daily=[task("late", "17:00"), task("early", "09:00"), task("middle", "12:00")])
+        scr = mock.Mock(**{"getch.side_effect": [ord("e"), ord("q")]})
+        with mock.patch.multiple(todoit.curses, curs_set=mock.DEFAULT, set_escdelay=mock.DEFAULT,
+                                 use_default_colors=mock.DEFAULT, init_pair=mock.DEFAULT), \
+                mock.patch.object(todoit, "load", return_value=s), mock.patch.object(todoit, "save") as save, \
+                mock.patch.object(todoit, "now", return_value=at(28, 10, 0)), \
+                mock.patch.object(todoit, "ask_task", return_value=("edited", "18:00")), \
+                mock.patch.object(todoit, "draw") as draw:
+            todoit.tui(scr)
+        self.assertEqual([x["title"] for x in s["daily"]], ["late", "edited", "middle"])
+        self.assertEqual(s["daily"][1]["due"], "18:00")
+        self.assertEqual(draw.call_args.args[2], 2)
+        self.assertEqual(draw.call_args.args[5], [("daily", i) for i in (2, 0, 1)])
+        save.assert_called_once_with(s)
+
+    def test_toggle_keeps_cursor_and_celebrates_in_pre_tick_order(self):
+        for done, frames in [(False, 45), (True, 120)]:
+            s = state(daily=[task("late", "17:00", done=done), task("early", "09:00"),
+                             task("middle", "12:00", done=done)])
+            scr = mock.Mock(**{"getmaxyx.return_value": (24, 90), "getch.side_effect": [ord(" "), ord("q")]})
+            with self.subTest(done=done), \
+                    mock.patch.multiple(todoit.curses, curs_set=mock.DEFAULT, set_escdelay=mock.DEFAULT,
+                                        use_default_colors=mock.DEFAULT, init_pair=mock.DEFAULT), \
+                    mock.patch.object(todoit, "load", return_value=s), mock.patch.object(todoit, "save") as save, \
+                    mock.patch.object(todoit, "now", return_value=at(28, 10, 0)), \
+                    mock.patch.object(todoit, "draw", return_value=[7, 8, 9]) as draw, \
+                    mock.patch.object(todoit, "play") as play:
+                todoit.tui(scr)
+            self.assertEqual([x["done"] for x in s["daily"]], [done, True, done])
+            self.assertEqual([c.args[2] for c in draw.call_args_list], [0, 0])
+            self.assertEqual(play.call_args.args[:4], (scr, s, 0, frames))
+            self.assertEqual(play.call_args.args[5], [("daily", i) for i in (1, 2, 0)])
+            self.assertEqual(draw.call_args.args[5], [("daily", i) for i in ((1, 2, 0) if done else (2, 0, 1))])
+            save.assert_called_once_with(s)
 
 
 class Store(unittest.TestCase):
