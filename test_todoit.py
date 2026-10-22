@@ -220,14 +220,14 @@ class AskTask(unittest.TestCase):
             return todoit.ask_task(None, kind, task_)
 
     def test_reprompts_until_due_parses(self):
-        self.assertEqual(self.ask(["neon", "someday", "+9999999", "tomorrow"]), ("neon", "2026-09-29 17:00"))
+        self.assertEqual(self.ask(["neon", "someday", "+9999999", "tomorrow", "notes"]), ("neon", "2026-09-29 17:00", "notes"))
 
     def test_rejects_new_todo_due_in_the_past(self):
-        self.assertEqual(self.ask(["neon", "today", "today 21:00"]), ("neon", "2026-09-28 21:00"))
+        self.assertEqual(self.ask(["neon", "today", "today 21:00", ""]), ("neon", "2026-09-28 21:00", ""))
 
     def test_editing_title_of_overdue_todo_keeps_its_due(self):
         old = task("neon", "2026-09-27 17:00")
-        self.assertEqual(self.ask(["neon form", "2026-09-27 17:00"], task_=old), ("neon form", "2026-09-27 17:00"))
+        self.assertEqual(self.ask(["neon form", "2026-09-27 17:00", ""], task_=old), ("neon form", "2026-09-27 17:00", ""))
 
     def test_cancel(self):
         self.assertIsNone(self.ask([""]))
@@ -235,9 +235,9 @@ class AskTask(unittest.TestCase):
         self.assertIsNone(self.ask(["neon", None, None]))
 
     def test_due_esc_goes_back_to_title(self):
-        with mock.patch.object(todoit, "prompt", side_effect=["neon", "someday", None, "neon 2", "tomorrow"]) as prompt, \
+        with mock.patch.object(todoit, "prompt", side_effect=["neon", "someday", None, "neon 2", "tomorrow", ""]) as prompt, \
                 mock.patch.object(todoit, "now", return_value=at(28, 19, 0)):
-            self.assertEqual(todoit.ask_task(None, "todo"), ("neon 2", "2026-09-29 17:00"))
+            self.assertEqual(todoit.ask_task(None, "todo"), ("neon 2", "2026-09-29 17:00", ""))
         hint = todoit.HINT["todo"]
         self.assertEqual(prompt.call_args_list, [
             mock.call(None, "title: ", "", esc_empty=True),
@@ -245,7 +245,37 @@ class AskTask(unittest.TestCase):
             mock.call(None, f"✗ invalid · {hint}: ", "someday", esc_empty=True),
             mock.call(None, "title: ", "neon", esc_empty=True),
             mock.call(None, f"{hint}: ", "", esc_empty=True),
+            mock.call(None, "description (enter to skip): ", "", esc_empty=True),
         ])
+
+    def test_description_esc_goes_back_to_due_with_answers_kept(self):
+        old = {**task("neon", "2026-09-30 17:00"), "description": "existing notes"}
+        answers = ["neon 2", "tomorrow", None, "2026-09-30 18:00", "new notes"]
+        with mock.patch.object(todoit, "prompt", side_effect=answers) as prompt, \
+                mock.patch.object(todoit, "now", return_value=at(28, 19, 0)):
+            self.assertEqual(todoit.ask_task(None, "todo", old), ("neon 2", "2026-09-30 18:00", "new notes"))
+        self.assertEqual(prompt.call_args_list, [
+            mock.call(None, "title: ", "neon", esc_empty=True),
+            mock.call(None, f"{todoit.HINT['todo']}: ", "2026-09-30 17:00", esc_empty=True),
+            mock.call(None, "description (enter to skip): ", "existing notes", esc_empty=True),
+            mock.call(None, f"{todoit.HINT['todo']}: ", "tomorrow", esc_empty=True),
+            mock.call(None, "description (enter to skip): ", "existing notes", esc_empty=True),
+        ])
+
+    def test_enter_skips_description_or_clears_edit(self):
+        for old in (None, {**task("neon", "2026-09-30 17:00"), "description": "notes"}):
+            with self.subTest(old=old):
+                self.assertEqual(self.ask(["neon", "tomorrow", ""], task_=old), ("neon", "2026-09-29 17:00", ""))
+
+    def test_description_esc_clears_stale_due_error_hint(self):
+        for bad, error in [("garbage", "invalid"), ("today", "that's in the past")]:
+            answers = ["neon", bad, "tomorrow", None, "tomorrow", ""]
+            with self.subTest(bad=bad), mock.patch.object(todoit, "prompt", side_effect=answers) as prompt, \
+                    mock.patch.object(todoit, "now", return_value=at(28, 19, 0)):
+                self.assertEqual(todoit.ask_task(None, "todo"), ("neon", "2026-09-29 17:00", ""))
+            hint = todoit.HINT["todo"]
+            self.assertEqual(prompt.call_args_list[2], mock.call(None, f"✗ {error} · {hint}: ", bad, esc_empty=True))
+            self.assertEqual(prompt.call_args_list[4], mock.call(None, f"{hint}: ", "tomorrow", esc_empty=True))
 
 
 class Edit(unittest.TestCase):
@@ -371,6 +401,9 @@ class Display(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_help_keeps_quit_visible_at_80_columns(self):
+        self.assertLessEqual(todoit.HELP.index("q quit") + len("q quit"), 78)
+
     def test_labels(self):
         t = at(28, 16, 45)
         for kind, t_, want in [
@@ -392,8 +425,11 @@ class Display(unittest.TestCase):
 
     def test_draw_panel_header_and_focus_window(self):
         scr = mock.Mock(**{"getmaxyx.return_value": (12, 40)})
-        with mock.patch.object(todoit, "draw"), mock.patch.object(todoit, "put") as put:
-            todoit.draw_panel(scr, state(), 0, "t", list("abcde"), focus=4)
+        s, t = state(), at(28, 16, 0)
+        with mock.patch.object(todoit, "draw") as draw, mock.patch.object(todoit, "put") as put, \
+                mock.patch.object(todoit, "now", return_value=t):
+            todoit.draw_panel(scr, s, 0, "t", list("abcde"), focus=4)
+        draw.assert_called_once_with(scr, s, 0, t)
         texts = [c.args[3] for c in put.call_args_list]
         self.assertIn(' spawn agent · "t" ', texts)
         self.assertEqual([x for x in texts if x in "abcde"], ["a", "e"])
@@ -469,7 +505,7 @@ class Display(unittest.TestCase):
         with mock.patch.object(todoit, "draw") as draw, mock.patch.object(todoit, "step"), \
                 mock.patch.object(todoit, "shimmer"), mock.patch.object(todoit, "now", return_value=t):
             todoit.play(scr, s, 0, 2, fx, rows)
-        self.assertEqual(draw.call_args_list, [mock.call(scr, s, 0, t, rows=rows)] * 2)
+        self.assertEqual(draw.call_args_list, [mock.call(scr, s, 0, t, None, rows)] * 2)
 
     def test_momentum_splits_due_today_from_overdue(self):
         s = state(daily=[task("done", "09:00", done=True), task("missed", "12:00"), task("later", "18:00")],
@@ -515,6 +551,125 @@ class Display(unittest.TestCase):
         self.assertEqual(todoit.fit("日本語abc", 5), "日本")  # 語 needs 2 more cols: stop, never skip ahead
         self.assertEqual(todoit.fit("review a PR", 6), "review")
 
+    def test_width_and_shorten(self):
+        self.assertEqual([todoit.width(c) for c in "a日✦🚀"], [1, 2, 1, 2])
+        for text, cols, want in [("abc", 3, "abc"), ("abcd", 3, "ab…"), ("日本語", 5, "日本…"),
+                                  ("abc", 1, "…"), ("", 0, "")]:
+            self.assertEqual(todoit.shorten(text, cols), want)
+
+    def test_link_and_head_use_first_url_title_before_description(self):
+        for title, desc, want, shown in [
+            ("Review [PR](https://title/1) https://title/2", "https://body/1", "https://title/1", "Review PR https://title/2 ↗"),
+            ("Review", "[notes](https://body/1) https://body/2", "https://body/1", "Review ↗"),
+            ("Review", "", None, "Review"),
+        ]:
+            t = {"title": title, **({"description": desc} if desc else {})}
+            self.assertEqual(todoit.link(t), want)
+            self.assertEqual(todoit.head(t), shown)
+
+    def test_fold_reserves_marker_columns_and_marks_description(self):
+        for title, desc, want in [("abcde", "", ("abcde", False)), ("abcdef", "", ("ab…", True)),
+                                   ("abcde", "notes", ("ab…", True)), ("ab", "notes", ("ab", True)),
+                                   ("日本語", "", ("日…", True))]:
+            self.assertEqual(todoit.fold({"title": title, "description": desc}, "09:00", 20), want)
+
+    def test_unfold_wraps_title_and_description_with_contextual_hint(self):
+        t = {"title": "one two three four five", "description": "notes " * 8}
+        titles, body = todoit.unfold(t, "09:00", 30)
+        self.assertEqual(titles, ["one two three", "four five"])
+        self.assertTrue(all(len(line) <= 21 for line, _ in body[1:-2]))
+        self.assertEqual(" ".join(line for line, _ in body[1:-2]), t["description"].strip())
+        self.assertEqual(body[0], ("description", todoit.curses.A_DIM))
+        self.assertEqual(body[-2:], [("", 0), ("← collapse   e edit", todoit.curses.A_DIM)])
+        for title, desc in [("[PR](https://title)", ""), ("PR", "https://body")]:
+            titles, body = todoit.unfold({"title": title, "description": desc}, "09:00", 80)
+            self.assertEqual(titles, ["PR ↗"])
+            self.assertEqual(body[-1], ("← collapse   e edit   o open link", todoit.curses.A_DIM))
+            if not desc:
+                self.assertEqual(len(body), 1)
+        self.assertEqual(todoit.unfold({"title": "abc"}, "09:00", 1)[0], ["a", "b", "c"])
+
+    def test_draw_expanded_block_grows_pad_and_shifts_later_rows(self):
+        first = {**task("one two three four five six seven", "18:00"), "description": "body words " * 5}
+        s = state(daily=[first, task("later", "19:00")])
+        titles, body = todoit.unfold(first, "18:00", 40)
+        extra = len(titles) - 1 + len(body)
+        results = []
+        for opened in (None, ("daily", 0)):
+            scr = mock.Mock(**{"getmaxyx.return_value": (12, 40)})
+            with mock.patch.object(todoit, "put") as put, mock.patch.object(todoit.curses, "newpad") as newpad:
+                ys = todoit.draw(scr, s, 0, at(28, 16, 0), opened=opened)
+            results.append(ys)
+            newpad.assert_called_once_with(max(12, 11 + (extra if opened else 0)), 40)
+            calls = [c.args for c in put.call_args_list if c.args[0] is newpad.return_value]
+            if opened:
+                self.assertEqual([c[3] for c in calls if c[2] == 7], titles + [line for line, _ in body] + ["later"])
+                self.assertEqual(sum(c[2:4] == (5, "│") for c in calls), len(body))
+                self.assertEqual([c[1] for c in calls if c[3] == "18:00"], [1])
+                self.assertFalse(any(c[3] == "≡" and c[1] == 1 for c in calls))
+        self.assertEqual(results[0][0], results[1][0])
+        self.assertEqual(results[1][1] - results[0][1], extra)
+
+    def test_draw_marker_uses_terminal_columns(self):
+        s = state(daily=[{**task("日本", "18:00"), "description": "notes"}])
+        scr = mock.Mock(**{"getmaxyx.return_value": (24, 80)})
+        with mock.patch.object(todoit, "put") as put, mock.patch.object(todoit.curses, "newpad") as newpad:
+            todoit.draw(scr, s, 0, at(28, 16, 0))
+        self.assertIn(mock.call(newpad.return_value, 1, 12, "≡", todoit.curses.A_DIM), put.call_args_list)
+
+    def test_draw_wide_open_title_puts_due_label_last_on_first_row(self):
+        s = state(daily=[{**task("日本語🚀" * 10, "18:00"), "description": "notes"}])
+        scr = mock.Mock(**{"getmaxyx.return_value": (24, 40)})
+        with mock.patch.object(todoit, "put") as put, mock.patch.object(todoit.curses, "newpad") as newpad:
+            todoit.draw(scr, s, 0, at(28, 16, 0), opened=("daily", 0))
+        calls = [c.args for c in put.call_args_list if c.args[0] is newpad.return_value]
+        titles = [c for c in calls if c[2] == 7 and "日" in c[3]]
+        self.assertGreater(len(titles), 1)
+        self.assertGreater(7 + sum(map(todoit.width, titles[0][3])), 33)
+        due = next(n for n, c in enumerate(calls) if c[3] == "18:00")
+        self.assertGreater(due, max(n for n, c in enumerate(calls) if c[2] == 7))
+        self.assertEqual(calls[due][1:4], (titles[0][1], 33, "18:00"))
+
+    def test_draw_opening_short_title_is_collapsed(self):
+        s = state(daily=[task("short", "18:00")])
+        scr = mock.Mock(**{"getmaxyx.return_value": (24, 80)})
+        calls = []
+        for opened in (None, ("daily", 0)):
+            with mock.patch.object(todoit, "put") as put, mock.patch.object(todoit.curses, "newpad") as newpad:
+                self.assertEqual(todoit.draw(scr, s, 0, at(28, 16, 0), opened=opened), [4])
+            newpad.assert_called_once_with(24, 80)
+            calls.append([c.args[1:] for c in put.call_args_list])
+        self.assertEqual(*calls)
+
+    def test_draw_tall_block_keeps_title_visible(self):
+        s = state(daily=[task(str(i), "18:00") for i in range(30)])
+        s["daily"][15]["description"] = "long description " * 100
+        scr = mock.Mock(**{"getmaxyx.return_value": (9, 50)})
+        with mock.patch.object(todoit, "put"), mock.patch.object(todoit.curses, "newpad") as newpad:
+            ys = todoit.draw(scr, s, 15, at(28, 16, 0), opened=("daily", 15))
+        newpad.return_value.overwrite.assert_called_once_with(scr, 16, 0, 3, 0, 7, 49)
+        self.assertEqual(ys[15], 3)
+
+    def test_draw_centers_expanded_span_that_fits_viewport(self):
+        s = state(daily=[task(str(i), "18:00") for i in range(30)])
+        s["daily"][15]["description"] = "notes"
+        scr = mock.Mock(**{"getmaxyx.return_value": (12, 50)})
+        with mock.patch.object(todoit, "put"), mock.patch.object(todoit.curses, "newpad") as newpad:
+            ys = todoit.draw(scr, s, 15, at(28, 16, 0), opened=("daily", 15))
+        newpad.return_value.overwrite.assert_called_once_with(scr, 14, 0, 3, 0, 10, 49)
+        self.assertEqual(ys[15], 5)
+
+    def test_draw_exact_fit_block_keeps_last_line_visible(self):
+        s = state(daily=[task(str(i), "18:00") for i in range(30)])
+        s["daily"][15]["description"] = "word " * 22
+        titles, body = todoit.unfold(s["daily"][15], "18:00", 40)
+        self.assertEqual(len(titles) + len(body), 8)
+        scr = mock.Mock(**{"getmaxyx.return_value": (12, 40)})
+        with mock.patch.object(todoit, "put"), mock.patch.object(todoit.curses, "newpad") as newpad:
+            ys = todoit.draw(scr, s, 15, at(28, 16, 0), opened=("daily", 15))
+        newpad.return_value.overwrite.assert_called_once_with(scr, 16, 0, 3, 0, 10, 39)
+        self.assertEqual((ys[15], ys[15] + 7), (3, 10))
+
     def test_rocket_explodes_at_apex_and_dead_particles_vanish(self):
         ps = [[10, 5, 0, 0, 999, 0, True], [3, 3, 0, 0, 1, 0, False]]
         with mock.patch.object(todoit, "put"):
@@ -524,6 +679,17 @@ class Display(unittest.TestCase):
 
 
 class Navigation(unittest.TestCase):
+    def run_tui(self, s, keys, **patches):
+        scr = mock.Mock(**{"getmaxyx.return_value": (24, 80), "getch.side_effect": keys})
+        patches = {"load": mock.Mock(return_value=s), "now": mock.Mock(return_value=at(28, 10, 0)),
+                   "draw": mock.Mock(return_value=list(range(4, 104))), "save": mock.Mock(),
+                   "C": mock.Mock(return_value=0), **patches}
+        with mock.patch.multiple(todoit.curses, curs_set=mock.DEFAULT, set_escdelay=mock.DEFAULT,
+                                 use_default_colors=mock.DEFAULT, init_pair=mock.DEFAULT), \
+                mock.patch.multiple(todoit, **patches):
+            todoit.tui(scr)
+        return scr, patches
+
     def test_order_keeps_storage_and_sorts_undone_then_done_by_due(self):
         dues = {"daily": ["17:00", "09:00", "12:00"],
                 "weekly": ["fri 17:00", "mon 09:00", "wed 12:00"],
@@ -600,6 +766,144 @@ class Navigation(unittest.TestCase):
             self.assertEqual([(c.args[2], c.args[4] if len(c.args) > 4 else None) for c in draw.call_args_list], want)
             self.assertTrue(all(c.args[:2] == (scr, s) and c.args[3] == at(28, 10, 0) for c in draw.call_args_list))
 
+    def test_search_and_next_follow_display_order_not_storage(self):
+        s = state(daily=[task("alpha done", "08:00", done=True), task("alpha late", "17:00"),
+                         task("alpha early", "09:00"), task("beta", "12:00")])
+        rows = [("daily", i) for i in (2, 3, 1, 0)]
+
+        def search(scr, label_, esc_empty=False, on_text=None):
+            on_text("alpha")
+            return "alpha"
+
+        _, mocks = self.run_tui(s, list(map(ord, "/nnnq")), prompt=mock.Mock(side_effect=search))
+        calls = mocks["draw"].call_args_list
+        self.assertEqual([c.args[2] for c in calls], [0, 2, 2, 3, 0, 2])
+        self.assertEqual(calls[1].args[2:], (2, at(28, 10, 0)))  # live search stays a collapsed draw
+        self.assertTrue(all(c.args[5] == rows for c in calls if len(c.args) > 5))
+
+    def test_expand_collapse_and_movement(self):
+        s = state(daily=[{**task("late", "17:00"), "description": "notes"},
+                         {**task("early", "09:00"), "description": "notes"}])
+        keys = [todoit.curses.KEY_RIGHT, todoit.curses.KEY_LEFT, todoit.curses.KEY_RIGHT,
+                ord("j"), todoit.curses.KEY_RIGHT, ord("q")]
+        _, mocks = self.run_tui(s, keys)
+        self.assertEqual([c.kwargs["opened"] for c in mocks["draw"].call_args_list],
+                         [None, ("daily", 1), None, ("daily", 1), None, ("daily", 0)])
+
+    def test_right_only_opens_rows_with_more(self):
+        for desc, opened in [("", None), ("notes", ("daily", 0))]:
+            s = state(daily=[{**task("short", "17:00"), "description": desc}])
+            with self.subTest(desc=desc):
+                _, mocks = self.run_tui(s, [todoit.curses.KEY_RIGHT, ord("q")])
+            self.assertEqual([c.kwargs["opened"] for c in mocks["draw"].call_args_list], [None, opened])
+
+    def test_returning_to_expanded_row_keeps_it_collapsed(self):
+        s = state(daily=[{**task("first", "09:00"), "description": "notes"}, task("second", "17:00")])
+        _, mocks = self.run_tui(s, [todoit.curses.KEY_RIGHT, ord("j"), ord("k"), ord("q")])
+        self.assertEqual([c.args[2] for c in mocks["draw"].call_args_list], [0, 0, 1, 0])
+        self.assertEqual([c.kwargs["opened"] for c in mocks["draw"].call_args_list], [None, ("daily", 0), None, None])
+
+    def test_right_twice_keeps_row_open(self):
+        s = state(daily=[{**task("first", "09:00"), "description": "notes"}])
+        _, mocks = self.run_tui(s, [todoit.curses.KEY_RIGHT, todoit.curses.KEY_RIGHT, ord("q")])
+        self.assertEqual([c.kwargs["opened"] for c in mocks["draw"].call_args_list], [None, ("daily", 0), ("daily", 0)])
+
+    def test_delete_open_row_does_not_open_neighbor_at_same_index(self):
+        s = state(daily=[{**task("first", "09:00"), "description": "notes"}, task("neighbor", "10:00")])
+        _, mocks = self.run_tui(s, [todoit.curses.KEY_RIGHT, ord("d"), ord("q")], confirm=mock.Mock(return_value=True))
+        self.assertEqual([c.kwargs["opened"] for c in mocks["draw"].call_args_list], [None, ("daily", 0), None])
+        self.assertEqual([x["title"] for x in s["daily"]], ["neighbor"])
+        mocks["save"].assert_called_once_with(s)
+
+    def test_edit_keeps_row_open_and_stores_or_removes_description(self):
+        for desc in ("new notes", ""):
+            s = state(daily=[{**task("early", "09:00"), "description": "old notes"}, task("late", "17:00")])
+            with self.subTest(desc=desc), self.assertLogs("todoit", "INFO") as logs:
+                _, mocks = self.run_tui(s, [todoit.curses.KEY_RIGHT, ord("e"), ord("q")],
+                                       ask_task=mock.Mock(return_value=("edited", "18:00", desc)))
+            self.assertEqual([c.kwargs["opened"] for c in mocks["draw"].call_args_list], [None, ("daily", 0), ("daily", 0)])
+            self.assertEqual(mocks["draw"].call_args.args[2], 1)
+            self.assertEqual(s["daily"][0], {**task("edited", "18:00"), **({"description": desc} if desc else {})})
+            self.assertIn("edited daily: edited (due 18:00)" + ("" if desc else " -description"), logs.output[0])  # old notes -> new notes is no change in presence
+            mocks["save"].assert_called_once_with(s)
+
+    def test_edit_logs_description_added(self):
+        s = state(daily=[task("early", "09:00")])
+        with self.assertLogs("todoit", "INFO") as logs:
+            self.run_tui(s, [ord("e"), ord("q")], ask_task=mock.Mock(return_value=("early", "09:00", "notes")))
+        self.assertEqual(s["daily"][0]["description"], "notes")
+        self.assertIn("edited daily: early (due 09:00) +description", logs.output[0])
+
+    def test_add_stores_only_nonempty_description_and_logs(self):
+        for desc in ("notes", ""):
+            s = state()
+            with self.subTest(desc=desc), self.assertLogs("todoit", "INFO") as logs:
+                _, mocks = self.run_tui(s, list(map(ord, "aq")),
+                                       ask_task=mock.Mock(return_value=("new", "2026-09-29 17:00", desc)))
+            self.assertEqual(s["todo"], [{**task("new", "2026-09-29 17:00"), **({"description": desc} if desc else {})}])
+            self.assertIn("added todo: new (due 2026-09-29 17:00)" + (" +description" if desc else ""), logs.output[0])
+            mocks["save"].assert_called_once_with(s)
+
+    def test_open_uses_first_title_or_description_link(self):
+        for title, desc, url in [("PR", "https://body/1 https://body/2", "https://body/1"),
+                                  ("[PR](https://title/1) https://title/2", "https://body", "https://title/1"),
+                                  ("PR", "notes", None)]:
+            s = state(daily=[{**task(title, "09:00"), "description": desc}])
+            with self.subTest(title=title), mock.patch.object(todoit.subprocess, "run") as run:
+                self.run_tui(s, list(map(ord, "oq")))
+            if url:
+                run.assert_called_once_with(["open", url], check=False)
+            else:
+                run.assert_not_called()
+
+    def test_tick_collapses_and_uses_redrawn_y_and_reloaded_pre(self):
+        old = state(daily=[task("late", "17:00"), {**task("early", "09:00"), "description": "notes"},
+                           task("removed", "12:00")])
+        fresh = state(daily=old["daily"][:2])
+        draw = mock.Mock(side_effect=[[4, 5, 6], [6, 9, 10], [12, 13], [4, 5]])
+        _, mocks = self.run_tui(old, [todoit.curses.KEY_RIGHT, ord(" "), ord("q")],
+                               load=mock.Mock(side_effect=[old, old, fresh, fresh]), draw=draw, celebrate=mock.Mock())
+        self.assertEqual(draw.call_args_list[1].kwargs, {"opened": ("daily", 1)})
+        self.assertEqual(draw.call_args_list[2], mock.call(mock.ANY, fresh, 0, at(28, 10, 0), None,
+                                                        [("daily", 1), ("daily", 0)]))
+        mocks["celebrate"].assert_called_once_with(mock.ANY, fresh, 0, "daily", 1, 12, [("daily", 1), ("daily", 0)])
+        self.assertEqual(draw.call_args.kwargs, {"opened": None})
+        self.assertEqual(draw.call_args.args[5], [("daily", 0), ("daily", 1)])
+
+    def test_shorter_reload_runs_real_animation_without_stale_rows(self):
+        old = state(daily=[task("selected", "09:00"), task("remaining", "12:00"), task("removed", "17:00")])
+        fresh = state(daily=[task("selected", "09:00"), task("remaining", "12:00")])
+        with mock.patch.object(todoit, "put"), mock.patch.object(todoit, "C", return_value=0), \
+                mock.patch.object(todoit.curses, "newpad"), mock.patch.object(todoit, "burst", return_value=[]):
+            _, mocks = self.run_tui(old, [ord(" "), ord("s"), ord("q")],
+                                   load=mock.Mock(side_effect=[old, fresh, fresh]), draw=mock.Mock(wraps=todoit.draw))
+        self.assertTrue(fresh["daily"][0]["done"])
+        self.assertEqual(mocks["draw"].call_count, 4)  # loop, collapsed redraw, animation, loop
+        self.assertEqual(mocks["draw"].call_args_list[2].args[5], [("daily", 0), ("daily", 1)])
+
+    def test_tick_resyncs_cursor_after_earlier_section_deleted(self):
+        old = state(daily=[task("d0", "09:00")],
+                    todo=[task("t0", "2026-09-29 17:00"), task("t1", "2026-09-30 17:00")])
+        fresh = state(todo=old["todo"][:])
+        with mock.patch.object(todoit, "put"), mock.patch.object(todoit.curses, "newpad"):
+            scr, mocks = self.run_tui(old, list(map(ord, "jj q")),
+                                     load=mock.Mock(side_effect=[old, old, old, fresh, fresh]),
+                                     draw=mock.Mock(wraps=todoit.draw), celebrate=mock.Mock())
+        self.assertEqual(mocks["draw"].call_args_list[2].args[2], 2)
+        rows = [("todo", 0), ("todo", 1)]
+        self.assertEqual(mocks["draw"].call_args_list[3], mock.call(scr, fresh, 1, at(28, 10, 0), None, rows))
+        mocks["celebrate"].assert_called_once_with(scr, fresh, 1, "todo", 1, 11, rows)
+        self.assertEqual([x["done"] for x in fresh["todo"]], [False, True])
+        mocks["save"].assert_called_once_with(fresh)
+
+    def test_undo_collapses_without_celebrating(self):
+        s = state(daily=[{**task("done", "09:00", done=True), "description": "notes"}])
+        _, mocks = self.run_tui(s, [todoit.curses.KEY_RIGHT, ord(" "), ord("q")], celebrate=mock.Mock())
+        self.assertFalse(s["daily"][0]["done"])
+        self.assertEqual([c.kwargs["opened"] for c in mocks["draw"].call_args_list], [None, ("daily", 0), None])
+        mocks["celebrate"].assert_not_called()
+        mocks["save"].assert_called_once_with(s)
+
     def test_add_follows_new_task_in_display_order(self):
         dues = {"daily": ("09:00", "17:00"), "weekly": ("mon 09:00", "fri 17:00"),
                 "todo": ("2026-09-29 09:00", "2026-09-30 17:00")}
@@ -611,7 +915,7 @@ class Navigation(unittest.TestCase):
                                         use_default_colors=mock.DEFAULT, init_pair=mock.DEFAULT), \
                     mock.patch.object(todoit, "load", return_value=s), mock.patch.object(todoit, "save") as save, \
                     mock.patch.object(todoit, "now", return_value=at(28, 10, 0)), \
-                    mock.patch.object(todoit, "ask_task", return_value=("new", dues[kind][0])), \
+                    mock.patch.object(todoit, "ask_task", return_value=("new", dues[kind][0], "")), \
                     mock.patch.object(todoit, "draw") as draw:
                 todoit.tui(scr)
             cur = draw.call_args.args[2]
@@ -627,7 +931,7 @@ class Navigation(unittest.TestCase):
                                  use_default_colors=mock.DEFAULT, init_pair=mock.DEFAULT), \
                 mock.patch.object(todoit, "load", return_value=s), mock.patch.object(todoit, "save") as save, \
                 mock.patch.object(todoit, "now", return_value=at(28, 10, 0)), \
-                mock.patch.object(todoit, "ask_task", return_value=("edited", "18:00")), \
+                mock.patch.object(todoit, "ask_task", return_value=("edited", "18:00", "")), \
                 mock.patch.object(todoit, "draw") as draw:
             todoit.tui(scr)
         self.assertEqual([x["title"] for x in s["daily"]], ["late", "edited", "middle"])
@@ -650,7 +954,8 @@ class Navigation(unittest.TestCase):
                     mock.patch.object(todoit, "play") as play:
                 todoit.tui(scr)
             self.assertEqual([x["done"] for x in s["daily"]], [done, True, done])
-            self.assertEqual([c.args[2] for c in draw.call_args_list], [0, 0])
+            self.assertEqual([c.args[2] for c in draw.call_args_list], [0, 0, 0])
+            self.assertEqual(draw.call_args_list[1].args[5], [("daily", i) for i in (1, 2, 0)])
             self.assertEqual(play.call_args.args[:4], (scr, s, 0, frames))
             self.assertEqual(play.call_args.args[5], [("daily", i) for i in (1, 2, 0)])
             self.assertEqual(draw.call_args.args[5], [("daily", i) for i in ((1, 2, 0) if done else (2, 0, 1))])

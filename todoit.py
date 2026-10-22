@@ -35,7 +35,7 @@ DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sun
 LINK = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
 URL = re.compile(r"https?://[^\s)]+")
 HINT = {"daily": "due HH:MM", "weekly": "due DAY [HH:MM]", "todo": "due today|tomorrow|+N|fri|MM-DD|YYYY-MM-DD [HH:MM]"}
-HELP = "space done a/r/w add todo/daily/weekly  e edit  d del  o link  c agent  q quit  / find  ⇧↑↓ section"
+HELP = "space done a/r/w add todo/daily/weekly  e edit  d del  o link  c agent  q quit  →/← expand  / find  ⇧↑↓ section"
 MODELS = {"claude": ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5"],
           "codex": ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-sol"]}
 CHEERS = ("nice.", "crushed it.", "one down.", "boom.", "look at you go.", "chef's kiss.", "shipped.", "unstoppable.")
@@ -269,15 +269,48 @@ def C(n):
     return curses.color_pair(n)
 
 
+def width(c):
+    return 2 if unicodedata.east_asian_width(c) in "WF" else 1
+
+
 def fit(text, cols):
     """Clip text to `cols` terminal columns; wide chars (CJK, emoji) take two."""
     out = []
     for c in text:
-        cols -= 2 if unicodedata.east_asian_width(c) in "WF" else 1
+        cols -= width(c)
         if cols < 0:
             break
         out.append(c)
     return "".join(out)
+
+
+def shorten(text, cols):
+    return text if fit(text, cols) == text else fit(text, cols - 1) + "…"
+
+
+def link(task):
+    m = URL.search(task["title"]) or URL.search(task.get("description", ""))
+    return m.group() if m else None
+
+
+def head(task):
+    return plain(task["title"]) + (" ↗" if link(task) else "")
+
+
+def fold(task, lab, w):
+    title, room = head(task), max(0, w - len(lab) - 10)
+    more = bool(task.get("description")) or fit(title, room) != title
+    return (shorten(title, room - 2) if more else title), more
+
+
+def unfold(task, lab, w):
+    # ponytail: textwrap counts characters, not columns; put clips wide chars. use column-aware wrapping if it bites
+    titles = textwrap.wrap(head(task), max(1, w - len(lab) - 10))
+    body = []
+    if task.get("description"):
+        body = [("description", curses.A_DIM)] + [(line, 0) for line in textwrap.wrap(task["description"], max(1, w - 9))] + [("", 0)]
+    body.append(("← collapse   e edit" + ("   o open link" if link(task) else ""), curses.A_DIM))
+    return titles, body
 
 
 def put(scr, y, x, text, attr=0):
@@ -344,7 +377,7 @@ def scroll_top(cy, total, room):
     return max(0, min(cy - room // 2, total - room))
 
 
-def draw(scr, s, cur, t, status=None, rows=None):
+def draw(scr, s, cur, t, status=None, rows=None, opened=None):
     """Render the list; returns the screen row of each task, in cursor order."""
     if rows is None:
         rows = order(s, t)
@@ -361,8 +394,16 @@ def draw(scr, s, cur, t, status=None, rows=None):
     put(scr, 1, BAR_X + bar + 1, f"{done}/{total} today", curses.A_BOLD)
     stats = f"{today} due today · {overdue} overdue"
     put(scr, 1, w - len(stats) - 1, stats, C(RED) | curses.A_BOLD if overdue else curses.A_DIM)
-    pad = curses.newpad(max(h, sum(len(s[k]) + 3 for k in KINDS)), w)
-    y, ys = 0, []
+    block, extra = None, 0
+    if opened:
+        kind, i = opened
+        task = s[kind][i]
+        lab, _ = label(kind, task, t)
+        if fold(task, lab, w)[1]:
+            block = unfold(task, lab, w)
+            extra = len(block[0]) - 1 + len(block[1])
+    pad = curses.newpad(max(h, sum(len(s[k]) + 3 for k in KINDS) + extra), w)
+    y, ys, span = 0, [], (0, 0)
     for kind in KINDS:
         tasks = s[kind]
         put(pad, y, 1, "─" * (w - 2), C(CYAN) | curses.A_DIM)
@@ -374,21 +415,32 @@ def draw(scr, s, cur, t, status=None, rows=None):
         if not tasks:
             put(pad, y, 4, f"nothing here, press {dict(daily='r', weekly='w', todo='a')[kind]} to add", curses.A_DIM)
             y += 1
-        for task in (tasks[i] for k, i in rows if k == kind):
+        for i in (i for k, i in rows if k == kind):
+            task = tasks[i]
             sel = len(ys) == cur
             lab, lab_attr = label(kind, task, t)
-            title = plain(task["title"]) + (" ↗" if URL.search(task["title"]) else "")
+            shown, more = fold(task, lab, w)
+            titles, body = block if (kind, i) == opened and block else ([shown], [])
+            ys.append(y)
             put(pad, y, 1, "▸" if sel else " ", C(MAGENTA) | curses.A_BOLD)
             put(pad, y, 3, "[✓]" if task["done"] else "[ ]", C(GREEN) | curses.A_BOLD if task["done"] else 0)
-            put(pad, y, 7, fit(title, max(0, w - len(lab) - 10)),
-                (curses.A_DIM if task["done"] else 0) | (curses.A_BOLD if sel else 0))
-            put(pad, y, w - len(lab) - 2, lab, lab_attr)
-            ys.append(y)
-            y += 1
+            if more and not body:
+                put(pad, y, 7 + sum(map(width, shown)) + 1, "≡", curses.A_DIM)
+            for title in titles:
+                put(pad, y, 7, title, (curses.A_DIM if task["done"] else 0) | (curses.A_BOLD if sel else 0))
+                y += 1
+            for line, attr in body:
+                put(pad, y, 5, "│", C(CYAN) | curses.A_DIM)
+                put(pad, y, 7, line, attr)
+                y += 1
+            put(pad, ys[-1], w - len(lab) - 2, lab, lab_attr)
+            if sel:
+                span = (ys[-1], y - 1)
         y += 1
     room = h - 4
     if room > 0:
-        top = scroll_top(ys[cur] if ys else 0, y, room)
+        # ponytail: a block taller than the viewport is clipped (title row stays visible); make ↑/↓ scroll inside it if that bites
+        top = min(scroll_top((sum(span) + 1) // 2, y, room), span[0])
         pad.overwrite(scr, top, 0, 3, 0, h - 2, w - 1)
         ys = [3 + v - top for v in ys]
     put(scr, h - 1, 1, status or HELP, curses.A_BOLD if status else curses.A_DIM)
@@ -481,9 +533,10 @@ def confirm(scr, msg):
 
 
 def ask_task(scr, kind, task=None):
-    """Prompt for (title, due); re-asks until the due parses and a new todo due is in the future.
-    Esc on an empty title cancels; on an empty due goes back to the title. None if cancelled."""
+    """Prompt for (title, due, description); re-ask invalid/past dues.
+    Esc on an empty field goes back a step, or cancels at title. None if cancelled."""
     title, raw = (task["title"], task["due"]) if task else ("", "")
+    desc = task.get("description", "") if task else ""
     while True:
         title = prompt(scr, "title: ", title, esc_empty=True)
         if not title:
@@ -502,7 +555,10 @@ def ask_task(scr, kind, task=None):
             if kind == "todo" and due != (task and task["due"]) and due_at(kind, {"due": due}, now().date()) <= now():
                 hint = "✗ that's in the past · " + HINT[kind]
                 continue
-            return title, due
+            text = prompt(scr, "description (enter to skip): ", desc, esc_empty=True)
+            if text is not None:
+                return title, due, text
+            hint = HINT[kind]
 
 
 def burst(x, y, n, speed, up=0.0, color=None):
@@ -549,7 +605,7 @@ def play(scr, s, cur, frames, fx, rows):
     scr.timeout(33)
     try:
         for f in range(frames):
-            draw(scr, s, cur, now(), rows=rows)
+            draw(scr, s, cur, now(), None, rows)
             step(scr, ps)
             shimmer(scr, s, f)
             fx(f, ps)
@@ -744,13 +800,16 @@ def tui(scr):
                                curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_BLUE), 1):
         curses.init_pair(n, color, -1)
     scr.timeout(1000)  # tick every second: clock, due colors, midnight rollover
-    cur, msg, query = 0, None, ""
+    cur, msg, query, opened = 0, None, "", None
     while True:
         s = load()
         t = now()
         rows = order(s, t)
         cur = max(0, min(cur, len(rows) - 1))
-        ys = draw(scr, s, cur, t, msg, rows)
+        # ponytail: a midnight purge can make an open storage index name a neighbor; use task IDs if it bites
+        if opened != (rows[cur] if rows else None):
+            opened = None
+        ys = draw(scr, s, cur, t, msg, rows, opened=opened)
         ch = scr.getch()
         if ch not in (-1, curses.KEY_RESIZE):
             msg = None
@@ -788,25 +847,38 @@ def tui(scr):
             kind = {ord("a"): "todo", ord("r"): "daily", ord("w"): "weekly"}[ch]
             got = ask_task(scr, kind)
             if got:
+                title, due, desc = got
                 s = load()
-                s[kind].append({"title": got[0], "due": got[1], "done": False, "sent": fresh_sent(kind, got[1], now())})
+                task = {"title": title, "due": due, "done": False, "sent": fresh_sent(kind, due, now())}
+                if desc:
+                    task["description"] = desc
+                s[kind].append(task)
                 save(s)
-                log.info("added %s: %s (due %s)", kind, *got)
+                log.info("added %s: %s (due %s)%s", kind, title, due, " +description" if desc else "")
                 cur = order(s, now()).index((kind, len(s[kind]) - 1))
         elif rows:
             kind, i = rows[cur]
             task = s[kind][i]
-            if ch in (ord(" "), ord("x"), 10):
+            if ch == curses.KEY_RIGHT:
+                lab, _ = label(kind, task, t)
+                opened = rows[cur] if fold(task, lab, scr.getmaxyx()[1])[1] else None
+            elif ch == curses.KEY_LEFT:
+                opened = None
+            elif ch in (ord(" "), ord("x"), 10):
                 s = reload(s)
                 if s:
                     task = s[kind][i]
+                    pre = order(s, t)
+                    cur = pre.index((kind, i))
+                    opened = None
                     task["done"] = not task["done"]
                     if task["done"]:
                         task["done_on"] = f"{now():%Y-%m-%d %H:%M}"
                     save(s)
                     log.info("%s: %s", "done" if task["done"] else "undone", task["title"])
                     if task["done"]:
-                        celebrate(scr, s, cur, kind, i, ys[cur], rows)
+                        ys = draw(scr, s, cur, t, msg, pre)
+                        celebrate(scr, s, cur, kind, i, ys[cur], pre)
             elif ch == ord("c"):
                 msg = spawn(scr, s, cur, task)
             elif ch == ord("e"):
@@ -816,19 +888,26 @@ def tui(scr):
                     task = s[kind][i]
                     if got[1] != task["due"]:
                         task["sent"] = fresh_sent(kind, got[1], now())
-                    task["title"], task["due"] = got
+                    task["title"], task["due"], desc = got
+                    old = task.get("description", "")
+                    if desc:
+                        task["description"] = desc
+                    else:
+                        task.pop("description", None)
                     save(s)
                     cur = order(s, now()).index((kind, i))
-                    log.info("edited %s: %s (due %s)", kind, *got)
+                    log.info("edited %s: %s (due %s)%s", kind, got[0], got[1],
+                             " +description" if desc and not old else " -description" if old and not desc else "")
             elif ch == ord("d"):
                 s = reload(s) if confirm(scr, f"delete '{plain(task['title'])}'? y/n") else None
                 if s:
+                    opened = None
                     log.info("deleted %s: %s", kind, s[kind].pop(i)["title"])
                     save(s)
             elif ch == ord("o"):
-                m = URL.search(task["title"])
-                if m:
-                    subprocess.run(["open", m.group()], check=False)
+                url = link(task)
+                if url:
+                    subprocess.run(["open", url], check=False)
 
 
 if __name__ == "__main__":
